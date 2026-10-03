@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# Local project notes are not distribution payloads.
+AGENTS.md
+PROJECT_STATE.md
+WORKLOG.md
 node_modules/
 docs/intro/*.mp4
 docs/intro/contact-sheet.jpg
