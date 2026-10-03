@@ -8,6 +8,7 @@
 - Added design61's single-sampler H3 long-video example. Public-copy Core display titles are standard; original user's file and all inputs/settings/wiring are preserved.
 - Rewrote the introduction around two tool functions: folder frames to video by path, and custom sampling for long video with ComfyUI-H3-Continuum. Advanced sampling details are in a separate document.
 - Updated the local HTML/Canvas introduction video to match this overview.
+- Preserved the remote deletion of `docs/intro`. Updated video is a Release attachment; editable animation artifacts remain local.
 - Validation: 30 CPU tests passed; the supplied saved flow route was verified; all four Review buttons and History responded to native clicks in the live ComfyUI frontend, with every server mutation blocked and zero model prompts submitted.
 
 The repair changes only frontend Review routing; H3 sampling, State/Session and stored Takes are unchanged.

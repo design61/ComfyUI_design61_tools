@@ -54,13 +54,7 @@ git clone https://github.com/design61/ComfyUI_design61_tools.git
 
 已经安装旧 `ComfyUI_FolderFramesToVideo_design61` 的用户，应禁用旧目录，避免相同节点 ID 重复注册，并保留需要的配置和 FFmpeg 文件。
 
-## 介绍动画
-
-[![功能介绍](docs/intro/preview.gif)](https://github.com/design61/ComfyUI_design61_tools/releases/download/v0.1.1/design61-intro.mp4)
-
-[观看介绍视频](https://github.com/design61/ComfyUI_design61_tools/releases/download/v0.1.1/design61-intro.mp4) · [HTML/Canvas 动画源码](docs/intro)
-
-动画为功能示意，不是生成效果或 GPU 实测录屏；使用本地 HTML/Canvas 与 FFmpeg 制作。
+[观看两个功能的介绍视频](https://github.com/design61/ComfyUI_design61_tools/releases/download/v0.1.1/design61-intro.mp4)。动画作为 Release 附件提供，为功能示意，不是生成效果或 GPU 实测录屏。
 
 ## 来源、许可与验证
 
