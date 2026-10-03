@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+docs/intro/*.mp4
+docs/intro/contact-sheet.jpg
+docs/intro/sampling.png
+docs/intro/sequence.png
+docs/intro/media.png
+docs/intro/folder.png
+docs/intro/closing.png

@@ -1,0 +1,1806 @@
+"""Integrated N-chunk Continuum runtime.
+
+V2 deliberately reuses the proven V1 continuation core. It changes execution
+orchestration only: all text/image conditioning is prepared first, H3 sampling
+runs for every chunk without intermediate VAE decoding, and decoding/assembly
+happens after the sampling phase.
+"""
+from __future__ import annotations
+import copy, hashlib, logging
+from contextvars import ContextVar
+from typing import Any
+import torch
+from ..branch_provenance import physical_groups
+from ..compatibility import accelerator_summary, check_comfy_h3_runtime
+from ..constants import (
+    DIAGNOSTICS_FULL, DIAGNOSTICS_OFF, DIAGNOSTICS_OPTIONS, FPS,
+    CONTINUUM_ACTUAL_PREFIX_STEPS, SEAM_CORRECTION_AUTO, SEAM_CORRECTION_OFF,
+    SEAM_CORRECTION_OPTIONS, V2_CONTINUITY_AUTO, normalize_diagnostics_mode,
+    PROMPT_MODE_FIXED,
+)
+from ..continuation import POLICY_REPLACE, prepare_conditioning
+from ..driving_audio import (
+    attach_driving_audio,
+    combine_driving_audio_identity,
+    encode_driving_audio,
+    slice_driving_audio_latent,
+)
+from ..guide_timeline import (
+    attach_still_image_guide,
+    combine_guide_identity,
+    encode_still_image_guide,
+    resolve_guide_for_physical_group,
+    validate_guide_visible_range,
+)
+from ..model_patch import LayoutValidationProfiler, clone_model_for_chunk
+from ..state import assert_context_unchanged, context_fingerprint, make_plan, select_context
+from ..temporal import (
+    align_frame_count_up,
+    audio_latent_t,
+    context_slots,
+    largest_context_capacity,
+    make_extension_shape,
+    video_latent_t,
+)
+from ..version import PACKAGE_VERSION
+
+from .decoder import decode_sequence, decode_sequence_with_seam, enforce_total_frames
+from .context_diagnostics import ContextDiagnosticsTracker
+from .h3_builder import attach_keyframes, empty_h3_latent, encode_identity_latents, encode_prompt_conditioning, encode_prompt_conditioning_cached, prepare_identity_assets
+from .motion import choose_context_frames
+from .prompts import prompt_plan_report, validate_prompt_plan
+from .sampling import latent_from_cpu, latent_to_cpu, sample_chunk
+from .seeds import derive_chunk_seed
+from .session import (
+    SessionValidationError, entry_to_state, make_chunk_entry, make_session, model_fingerprint,
+    session_summary, validate_chunk_entry, validate_session,
+)
+LOG=logging.getLogger("h3_continuum_join")
+class SequenceRuntimeError(RuntimeError): pass
+
+# RR-R4 is internal until its public and saved-run contracts are defined.
+# A ContextVar keeps the established 41-keyword run_sequence signatures intact
+# and isolates concurrent queue calls without a mutable module-global router.
+_REFERENCE_ROUTING_RUNTIME: ContextVar[Any | None] = ContextVar(
+    "h3_continuum_reference_routing_runtime", default=None,
+)
+
+REFERENCE_CONTEXT_V1="reference_context_v1"
+MASKED_VIDEO_PREFIX_V1="masked_video_prefix_v1"
+MASKED_AV_PREFIX_22_V1="masked_av_prefix_22_v1"
+MASKED_AV_PREFIX_39_V1="masked_av_prefix_39_v1"
+CONTINUATION_TRANSPORTS=(REFERENCE_CONTEXT_V1,MASKED_VIDEO_PREFIX_V1,MASKED_AV_PREFIX_22_V1,MASKED_AV_PREFIX_39_V1)
+
+def _record_context_diagnostics(*,tracker,reports,state,continuity,reused):
+    if tracker is None: return
+    try:
+        context_frames,_,_=choose_context_frames(continuity,state)
+        video_context,_,_=select_context(state,context_frames,include_audio=False)
+        reports.append(tracker.observe(video_context,source_chunk=int(state["clip_index"]),context_frames=context_frames,reused=bool(reused)))
+    except Exception as exc:
+        reports.append(f"context diagnostics source chunk {state.get('clip_index','?')}: unavailable ({exc})")
+
+def _check_decode_memory_budget(*,width,height,chunks,chunk_seconds):
+    target_frames=max(1,int(round(chunks*chunk_seconds*FPS))); max_chunk_frames=max(5,int(round(chunk_seconds*FPS))+39)
+    image_bytes=target_frames*width*height*3*4; transient_bytes=max_chunk_frames*width*height*3*4
+    required_bytes=image_bytes+int(transient_bytes*1.5)+1*1024**3; estimate_gib=required_bytes/1024**3; available_gib=None
+    try:
+        import psutil
+        available=int(psutil.virtual_memory().available); available_gib=available/1024**3
+    except ImportError: pass
+    return estimate_gib,available_gib
+
+def _clone_entry_for_reuse(entry):
+    entry=validate_chunk_entry(entry); result=dict(entry); result["plan"]=copy.deepcopy(entry["plan"]); result["reused"]=True; return result
+
+def _preserved_prefix(*,session,prompt_hashes,chunks,reroll_from_chunk,width,height,chunk_seconds,identity_hash,last_frame_hash,reference_storage_plan=None):
+    if session is None: return [],[]
+    notes=[]
+    try: session=validate_session(session)
+    except SessionValidationError as exc: return [],[f"saved session was ignored; generated a fresh run ({exc})"]
+    if int(session["width"])!=int(width) or int(session["height"])!=int(height): return [],["saved session resolution differs; generated a fresh run"]
+    if abs(float(session["chunk_seconds"])-float(chunk_seconds))>1e-6: return [],["saved session chunk duration differs; generated a fresh run"]
+    if str(session.get("identity_hash","none"))!=str(identity_hash): return [],["saved session identity differs; generated a fresh run"]
+    routed_limit=None
+    if reference_storage_plan is not None:
+        from ..v3.reference_storage_contract import (
+            ReferenceStorageContractError, compatible_session_prefix,
+        )
+        try:
+            routed_limit=compatible_session_prefix(
+                (session.get("settings") or {}).get("reference_routing_v1"),
+                reference_storage_plan,
+                saved_chunks=len(session["chunks"]),
+            )
+        except ReferenceStorageContractError as exc:
+            return [],[f"saved routed Session was ignored; generated a fresh run ({exc})"]
+        if routed_limit<len(session["chunks"]):
+            notes.append(f"routed Session reuse stopped after logical chunk {routed_limit}: Reference group changed")
+    else:
+        saved_last_frame_hash=(session.get("settings") or {}).get("last_frame_hash")
+        if str(saved_last_frame_hash or "none")!=str(last_frame_hash or "none"): return [],["saved session Last Frame differs; generated a fresh run"]
+    if reroll_from_chunk<0 or reroll_from_chunk>chunks: raise SessionValidationError("reroll_from_chunk must be 0 or a valid one-based chunk index")
+    limit=min(len(session["chunks"]),chunks)
+    if routed_limit is not None: limit=min(limit,routed_limit)
+    if reroll_from_chunk>0: limit=min(limit,reroll_from_chunk-1)
+    preserved=[]
+    for index in range(limit):
+        try: entry=validate_chunk_entry(session["chunks"][index])
+        except SessionValidationError as exc:
+            notes.append(f"session reuse stopped before chunk {index+1}: stored chunk was rejected ({exc})")
+            break
+        if entry["prompt_hash"]!=prompt_hashes[index]: notes.append(f"session reuse stopped before chunk {index+1}: prompt changed"); break
+        preserved.append(_clone_entry_for_reuse(entry))
+    if reroll_from_chunk==0 and len(preserved)==min(len(session["chunks"]),chunks):
+        notes.append(f"resuming after accepted chunk {len(session['chunks'])}" if len(session["chunks"])<chunks else "all requested chunks reused from the session")
+    elif reroll_from_chunk>0: notes.append(f"preserved chunks 1-{len(preserved)}; regenerated from chunk {reroll_from_chunk}")
+    return preserved,notes
+
+def _conditioning_cache_key(prompt, *, include_last, reference_assets=None):
+    return (prompt, False if reference_assets is not None else bool(include_last))
+
+
+def _record_prompt_cache_event(callback, event):
+    if callback is None:
+        return
+    try:
+        callback(str(event))
+    except Exception:
+        pass
+
+
+def _prompt_cache_diagnostics(events):
+    hits=sum(event=="hit" for event in events)
+    misses=sum(event=="miss" for event in events)
+    bypasses=len(events)-hits-misses
+    return (
+        "Prompt/CLIP cache [V3.5]: "
+        f"hits={hits}, misses={misses}, bypasses={bypasses}, "
+        f"encode_calls={misses+bypasses}."
+    )
+
+
+def _conditioning_cache(*,clip,prompts,assets,final_has_last_frame,reference_assets=None,reference_audio_assets=None,timeline_video_assets=None,prompt_conditioning_cache=False,prompt_cache_event=None):
+    cache={}; final_index=len(prompts)-1
+    for index,prompt in enumerate(prompts):
+        include_last=bool(final_has_last_frame and index==final_index); key=_conditioning_cache_key(prompt,include_last=include_last,reference_assets=reference_assets)
+        if key in cache: continue
+        if reference_assets is not None:
+            from ..reference import encode_reference_prompt
+            if bool(prompt_conditioning_cache):
+                _record_prompt_cache_event(prompt_cache_event,"bypass_reference_inputs")
+            cache[key]=encode_reference_prompt(clip,prompt,reference_assets,first_image=assets.first_image,last_image=assets.last_image,reference_audio_assets=reference_audio_assets,timeline_video_assets=timeline_video_assets)
+        else:
+            cache_allowed=bool(prompt_conditioning_cache and reference_audio_assets is None and timeline_video_assets is None)
+            if bool(prompt_conditioning_cache) and not cache_allowed:
+                _record_prompt_cache_event(prompt_cache_event,"bypass_reference_inputs")
+            if cache_allowed:
+                cache[key]=encode_prompt_conditioning_cached(clip,prompt,first_image=assets.first_image,last_image=assets.last_image if include_last else None,first_image_fingerprint=assets.identity_hash,last_image_fingerprint=assets.last_frame_hash if include_last else "none",cache_enabled=True,cache_event=prompt_cache_event)
+            else:
+                cache[key]=encode_prompt_conditioning(clip,prompt,first_image=assets.first_image,last_image=assets.last_image if include_last else None,reference_audio_assets=reference_audio_assets,timeline_video_assets=timeline_video_assets)
+    return cache
+
+
+FLF_STRATEGY = "terminal_merged_10s_seed_v2"
+TERMINAL_SEED_POLICY = "physical_window_seed_v2"
+TERMINAL_MERGE_CHUNK_SECONDS = 5.0
+TERMINAL_MERGE_CONTEXT_FRAMES = 22
+TERMINAL_PROMPT_POLICY_SHARED = "shared_prompt_v1"
+TERMINAL_PROMPT_POLICY_TIMELINE = "paired_timeline_v1"
+
+
+def _flf_contract_identity(base_hash: str) -> str:
+    payload = f"{base_hash}|flf_strategy={FLF_STRATEGY}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _continuation_transport_identity(base_hash: str, transport: str) -> str:
+    """Scope non-default continuation sessions without revising legacy identity."""
+    if str(transport) == REFERENCE_CONTEXT_V1:
+        return str(base_hash)
+    payload = f"{base_hash}|continuation_transport={transport}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _terminal_flf_merge_enabled(
+    *,
+    multi_chunk_flf: bool,
+    chunks: int,
+    chunk_seconds: float,
+    prompt_hashes: list[str],
+    timeline_video_source,
+) -> bool:
+    return bool(
+        multi_chunk_flf
+        and int(chunks) >= 2
+        and abs(float(chunk_seconds) - TERMINAL_MERGE_CHUNK_SECONDS) <= 1e-6
+        and timeline_video_source is None
+        and len(prompt_hashes) >= 2
+    )
+
+
+def _terminal_pair_prompt(
+    prompts: list[str],
+    *,
+    pair_start: int,
+    chunk_seconds: float,
+) -> tuple[str, str]:
+    """Build one physical prompt without changing either logical prompt."""
+
+    first = str(prompts[int(pair_start)])
+    second = str(prompts[int(pair_start) + 1])
+    if first == second:
+        return first, TERMINAL_PROMPT_POLICY_SHARED
+    split = f"{float(chunk_seconds):g}"
+    stop = f"{float(chunk_seconds) * 2.0:g}"
+    return (
+        f"[0-{split}s]\n{first}\n\n[{split}-{stop}s]\n{second}",
+        TERMINAL_PROMPT_POLICY_TIMELINE,
+    )
+
+
+def _atomic_terminal_prefix(
+    preserved: list[dict[str, Any]],
+    *,
+    chunks: int,
+    reroll_from_chunk: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Never reuse only one logical half of a shared terminal sample."""
+    pair_start = int(chunks) - 2
+    reroll_hits_pair = int(reroll_from_chunk) in (int(chunks) - 1, int(chunks))
+    partial_pair = pair_start < len(preserved) < int(chunks)
+    if (reroll_hits_pair or partial_pair) and len(preserved) > pair_start:
+        return preserved[:pair_start], True
+    return preserved, False
+
+
+def _terminal_strategy_mismatch(
+    session: dict[str, Any] | None,
+    *,
+    merge_enabled: bool,
+) -> bool:
+    """Reject only prefixes that will actually use Terminal Merge sampling."""
+    if not merge_enabled or session is None:
+        return False
+    saved_strategy = str((session.get("settings") or {}).get("flf_execution", ""))
+    return saved_strategy != FLF_STRATEGY
+
+
+def _physical_group_limit(value: int | None) -> int | None:
+    """Validate the private V3 execution cap without changing sampling identity."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise SequenceRuntimeError(
+            "max_new_physical_groups must be None or a positive integer"
+        )
+    return value
+
+
+def _terminal_sampling_plan(
+    *,
+    chunks: int,
+    completed: int,
+    merge_enabled: bool,
+) -> tuple[tuple[int, ...], bool]:
+    """Legacy internal adapter delegated to the R3 Pure Planner."""
+
+    from ..v3.execution_planner import ExecutionPlanningError, build_execution_plan
+    from ..v3.planning_types import ContinuationSourceFacts
+
+    boundaries=tuple(
+        (int(group.start),int(group.end))
+        for group in physical_groups(
+            chunks=int(chunks),
+            terminal_merge_enabled=bool(merge_enabled),
+        )
+        if int(group.end)<=int(completed)
+    )
+    facts=ContinuationSourceFacts(
+        kind=("explicit_session" if int(completed)>0 else "none"),
+        accepted_chunks=int(completed),
+        reroll_from_chunk=0,
+        physical_group_boundaries=boundaries,
+    )
+    try:
+        plan=build_execution_plan(
+            continuation_source_facts=facts,
+            configured_chunks=int(chunks),
+            terminal_merge_enabled=bool(merge_enabled),
+            max_new_physical_groups=None,
+            review_execution=None,
+        )
+    except ExecutionPlanningError as exc:
+        raise SequenceRuntimeError(str(exc)) from exc
+    normal_indices=tuple(
+        descriptor.logical_chunks[0]-1
+        for descriptor in plan.groups_to_generate
+        if not descriptor.terminal_atomic
+    )
+    terminal_pending=any(
+        descriptor.terminal_atomic for descriptor in plan.groups_to_generate
+    )
+    return normal_indices,terminal_pending
+
+
+def _terminal_physical_seed_plan(
+    *,
+    base_seed: int,
+    physical_window_start_index: int,
+    reroll_nonce: int,
+) -> dict[str, Any]:
+    """Return the one physical seed and the matching logical-entry metadata."""
+    start_index = int(physical_window_start_index)
+    nonce = int(reroll_nonce)
+    if start_index < 0:
+        raise ValueError("physical_window_start_index must be non-negative")
+    if nonce < 0:
+        raise ValueError("reroll_nonce must be non-negative")
+    if start_index == 0 and nonce == 0:
+        physical_seed = int(base_seed)
+    else:
+        physical_seed = derive_chunk_seed(base_seed, start_index, nonce)
+    return {
+        "physical_seed": physical_seed,
+        "logical_entry_seeds": (physical_seed, physical_seed),
+    }
+
+
+def _terminal_execution_semantics(
+    *,
+    merge_enabled: bool,
+    prompt_policy: str | None = None,
+    continuation_transport: str = REFERENCE_CONTEXT_V1,
+) -> dict[str, str] | None:
+    semantics: dict[str, str] = {}
+    if merge_enabled:
+        semantics.update({
+            "flf_execution": FLF_STRATEGY,
+            "terminal_seed_policy": TERMINAL_SEED_POLICY,
+        })
+        if prompt_policy:
+            semantics["terminal_prompt_policy"] = str(prompt_policy)
+    if str(continuation_transport) != REFERENCE_CONTEXT_V1:
+        semantics["continuation_transport"] = str(continuation_transport)
+    return semantics or None
+
+
+def _terminal_pair_contract(*, initial_pair: bool, chunk_seconds: float) -> dict[str, Any]:
+    """Derive physical and logical AV ranges without fixed latent indices."""
+    if abs(float(chunk_seconds) - TERMINAL_MERGE_CHUNK_SECONDS) > 1e-6:
+        raise SequenceRuntimeError("terminal merged sampling currently requires 5-second logical chunks")
+    initial_frames = align_frame_count_up(int(round(float(chunk_seconds) * FPS)))
+    extension = make_extension_shape(
+        TERMINAL_MERGE_CONTEXT_FRAMES,
+        float(chunk_seconds),
+    )
+    if initial_pair:
+        physical_frames = align_frame_count_up(int(round(2.0 * float(chunk_seconds) * FPS)))
+        logical_frames = (initial_frames, extension.total_frames)
+        logical_trims = (0, TERMINAL_MERGE_CONTEXT_FRAMES)
+        first_video_stop = video_latent_t(initial_frames)
+        first_audio_stop = audio_latent_t(initial_frames)
+    else:
+        physical_frames = make_extension_shape(
+            TERMINAL_MERGE_CONTEXT_FRAMES,
+            2.0 * float(chunk_seconds),
+        ).total_frames
+        logical_frames = (extension.total_frames, extension.total_frames)
+        logical_trims = (
+            TERMINAL_MERGE_CONTEXT_FRAMES,
+            TERMINAL_MERGE_CONTEXT_FRAMES,
+        )
+        first_video_stop = video_latent_t(extension.total_frames)
+        first_audio_stop = audio_latent_t(extension.total_frames)
+    physical_video_stop = video_latent_t(physical_frames)
+    physical_audio_stop = audio_latent_t(physical_frames)
+    video_overlap = context_slots(TERMINAL_MERGE_CONTEXT_FRAMES)
+    audio_overlap = audio_latent_t(TERMINAL_MERGE_CONTEXT_FRAMES)
+    video_slices = (
+        (0, first_video_stop),
+        (first_video_stop - video_overlap, physical_video_stop),
+    )
+    audio_slices = (
+        (0, first_audio_stop),
+        (first_audio_stop - audio_overlap, physical_audio_stop),
+    )
+    for index in range(2):
+        expected_video = video_latent_t(logical_frames[index])
+        expected_audio = audio_latent_t(logical_frames[index])
+        if video_slices[index][1] - video_slices[index][0] != expected_video:
+            raise SequenceRuntimeError("derived terminal video split does not match its logical frame count")
+        if audio_slices[index][1] - audio_slices[index][0] != expected_audio:
+            raise SequenceRuntimeError("derived terminal audio split does not match its logical frame count")
+    return {
+        "initial_pair": bool(initial_pair),
+        "physical_frames": int(physical_frames),
+        "physical_context_frames": 0 if initial_pair else TERMINAL_MERGE_CONTEXT_FRAMES,
+        "logical_frames": logical_frames,
+        "logical_trims": logical_trims,
+        "video_slices": video_slices,
+        "audio_slices": audio_slices,
+    }
+
+
+def _split_terminal_merged_latents(
+    video: torch.Tensor,
+    audio: torch.Tensor,
+    contract: dict[str, Any],
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    expected_video = video_latent_t(int(contract["physical_frames"]))
+    expected_audio = audio_latent_t(int(contract["physical_frames"]))
+    if int(video.shape[2]) != expected_video or int(audio.shape[-1]) != expected_audio:
+        raise SequenceRuntimeError(
+            "terminal merged sampler output does not match the derived physical AV grid: "
+            f"video T={video.shape[2]} (expected {expected_video}), "
+            f"audio T={audio.shape[-1]} (expected {expected_audio})"
+        )
+    parts=[]
+    for video_range,audio_range in zip(contract["video_slices"],contract["audio_slices"]):
+        video_part=video[:,:,video_range[0]:video_range[1],...].contiguous()
+        audio_part=audio[...,audio_range[0]:audio_range[1]].contiguous()
+        parts.append((video_part,audio_part))
+    return parts[0],parts[1]
+
+
+def _attach_terminal_flf_keyframes(
+    conditioning,
+    *,
+    video_context: torch.Tensor,
+    context_frames: int,
+    frame_count: int,
+    last_latent: torch.Tensor,
+):
+    final_index = int(frame_count) - 1
+    boundary_index = max(0, min(final_index - 1, int(context_frames) - 1))
+    boundary_latent = video_context[:, :, -1:, ...].contiguous()
+    excluded = {boundary_index, final_index}
+    for _, metadata in conditioning:
+        keyframes = [
+            dict(item)
+            for item in (metadata.get("minimax_keyframes") or [])
+            if int(item.get("resolved_frame_index", -1)) not in excluded
+        ]
+        keyframes.extend(
+            [
+                {"resolved_frame_index": boundary_index, "latent": boundary_latent},
+                {"resolved_frame_index": final_index, "latent": last_latent},
+            ]
+        )
+        keyframes.sort(key=lambda item: int(item.get("resolved_frame_index", 0)))
+        metadata["minimax_keyframes"] = keyframes
+        metadata["minimax_frame_count"] = int(frame_count)
+    return conditioning
+
+def _run_runtime_internal(*,model:Any,clip:Any,video_vae:Any,audio_vae:Any,sampler:Any,sigmas:torch.Tensor,first_frame:torch.Tensor|None,last_frame:torch.Tensor|None,prompt_plan:dict[str,Any],width:int,height:int,continuity:str,base_seed:int,audio_continuity:bool,exact_total_duration:bool,diagnostics_mode:str,reroll_from_chunk:int,reroll_nonce:int,strict_compatibility:bool,debug:bool,seam_correction:str=SEAM_CORRECTION_OFF,enable_preview:bool=True,session:dict[str,Any]|None=None,initial_state:dict[str,Any]|None=None,latent_only:bool=False,reference_assets=None,reference_audio_source=None,reference_audio_vae=None,driving_audio_source=None,driving_audio_vae=None,reference_video_source=None,timeline_video_source=None,guide_source=None,capture_refine_context:bool=False,memory_attribution:bool=False,prompt_conditioning_cache:bool=False,reference_encode_cache:bool=False,continuation_transport:str=REFERENCE_CONTEXT_V1,max_new_physical_groups:int|None=None,_memory_attribution_collector:Any=None,_diagnostic_continuation_policy:Any=None):
+    from ..conditioning import (
+        conditioning_display_label, conditioning_mode_from_presence,
+        detect_conditioning_mode,
+    )
+    from ..run_storage import get_active_run_storage
+    from ..v3.runtime_coordinator import (
+        InternalRuntimeCoordinator,
+        RuntimeCoordinatorError,
+    )
+    from ..v3.sampling_engine import sample_physical_group
+    from ..video_reference_modes import (
+        FOLLOW_PLAN_KEY, FollowVideoSource, build_follow_group_conditioning,
+    )
+    _reference_routing_runtime = _REFERENCE_ROUTING_RUNTIME.get()
+    following_video = isinstance(reference_video_source, FollowVideoSource)
+    storage_controller=get_active_run_storage()
+    if _reference_routing_runtime is not None:
+        from ..v3.reference_runtime import ReferenceRoutingRuntime
+        if not isinstance(_reference_routing_runtime, ReferenceRoutingRuntime):
+            raise SequenceRuntimeError("RR-R4 requires an internal ReferenceRoutingRuntime")
+        if any((reference_assets is not None, initial_state is not None)):
+            raise SequenceRuntimeError(
+                "RR-R4 internal routing cannot combine with legacy Reference assets, "
+                "or initial State"
+            )
+    runtime_coordinator=InternalRuntimeCoordinator(
+        storage_controller=storage_controller,
+        input_session=session,
+        initial_state=initial_state,
+    )
+    session,initial_state=runtime_coordinator.prepare_inputs()
+    review_execution=None
+    capture_refine_context=bool(capture_refine_context and latent_only)
+    memory_attribution=bool(memory_attribution and capture_refine_context)
+    prompt_conditioning_cache=bool(prompt_conditioning_cache and capture_refine_context and latent_only)
+    reference_encode_cache=bool(reference_encode_cache and latent_only)
+    max_new_physical_groups=_physical_group_limit(max_new_physical_groups)
+    if max_new_physical_groups is not None and not latent_only:
+        raise SequenceRuntimeError(
+            "max_new_physical_groups requires latent-only V3 execution"
+        )
+    prompt_cache_events=[]
+    reference_encode_cache_events=[]
+    memory_collector=None
+    refine_groups=[]
+    make_refine_group=make_refine_context=None
+    if bool(capture_refine_context):
+        from ..v3.refine_context import make_refine_context, make_refine_group
+    diagnostics_mode=normalize_diagnostics_mode(diagnostics_mode); memory_collector=_memory_attribution_collector if memory_attribution and diagnostics_mode==DIAGNOSTICS_FULL else None; capture_memory=None
+    if memory_collector is not None:
+        from ..v3.memory_attribution import capture_attribution_fail_soft
+        capture_memory=capture_attribution_fail_soft
+    plan=validate_prompt_plan(prompt_plan); chunks=int(plan["chunks"]); chunk_seconds=float(plan["chunk_seconds"]); prompts=list(plan["prompts"]); prompt_hashes=list(plan["hashes"]); width,height=int(width),int(height)
+    visible_target_frames=int(round(chunks*chunk_seconds*FPS))
+    validate_guide_visible_range(guide_source,target_frames=visible_target_frames)
+    continuation_transport=str(continuation_transport)
+    if continuation_transport not in CONTINUATION_TRANSPORTS:
+        raise SequenceRuntimeError(
+            f"unknown private continuation transport: {continuation_transport!r}"
+        )
+    # Legacy workflow input only. Runtime compatibility is advisory in V3.4.
+    strict_compatibility=False
+    if width<=0 or height<=0 or width%32 or height%32: raise SequenceRuntimeError("width and height must be positive multiples of 32")
+    if diagnostics_mode not in DIAGNOSTICS_OPTIONS: raise SequenceRuntimeError(f"unknown diagnostics mode: {diagnostics_mode!r}")
+    if seam_correction not in SEAM_CORRECTION_OPTIONS: raise SequenceRuntimeError(f"unknown seam correction mode: {seam_correction!r}")
+    if not 0<=int(reroll_from_chunk)<=chunks: raise SequenceRuntimeError("reroll_from_chunk must be 0 or a valid one-based chunk index")
+    try:
+        runtime_coordinator.validate_initial_state_reroll(reroll_from_chunk)
+    except RuntimeCoordinatorError as exc:
+        raise SequenceRuntimeError(str(exc)) from exc
+    reference_mode_source=(
+        reference_assets if _reference_routing_runtime is None
+        else (_reference_routing_runtime if _reference_routing_runtime.has_selected_references else None)
+    )
+    try: conditioning_mode=detect_conditioning_mode(first_frame=first_frame,last_frame=last_frame,reference_assets=reference_mode_source)
+    except ValueError as exc: raise SequenceRuntimeError(str(exc)) from exc
+    conditioning_display=conditioning_display_label(has_first=first_frame is not None,has_last=last_frame is not None,has_reference=reference_mode_source is not None)
+    reference_warning=""
+    if reference_assets is not None:
+        from ..reference import validate_reference_prompts
+        reference_warning=validate_reference_prompts(prompts,reference_assets.count,picture_offset=int(first_frame is not None)+int(last_frame is not None))
+    from ..reference_audio import (
+        ReferenceAudioBundle,
+        combine_reference_audio_identity,
+        validate_reference_audio_prompts,
+    )
+    reference_audio_warning=validate_reference_audio_prompts(prompts,reference_audio_source)
+    from ..reference_video import (
+        combine_reference_video_identity,
+        validate_reference_video_prompts,
+    )
+    reference_video_warning=validate_reference_video_prompts(prompts,reference_video_source)
+    from ..timeline_video import (
+        combine_timeline_video_identity,
+        validate_timeline_video_prompts,
+    )
+    timeline_video_warning=validate_timeline_video_prompts(prompts,timeline_video_source)
+    decode_estimate_gib=0.0; available_ram_gib=None
+    if not latent_only: decode_estimate_gib,available_ram_gib=_check_decode_memory_budget(width=width,height=height,chunks=chunks,chunk_seconds=chunk_seconds)
+    issues=check_comfy_h3_runtime()
+    assets=prepare_identity_assets(video_vae,width=width,height=height,first_frame=first_frame,last_frame=last_frame,encode_latents=False)
+    multi_chunk_flf=bool(chunks>=2 and first_frame is not None and last_frame is not None)
+    terminal_merge_enabled=_terminal_flf_merge_enabled(multi_chunk_flf=multi_chunk_flf,chunks=chunks,chunk_seconds=chunk_seconds,prompt_hashes=prompt_hashes,timeline_video_source=timeline_video_source)
+    if _reference_routing_runtime is not None:
+        try:
+            _reference_routing_runtime.check_physical_contract(
+                chunks=chunks, terminal_merge_enabled=terminal_merge_enabled,
+            )
+        except ValueError as exc:
+            raise SequenceRuntimeError(str(exc)) from exc
+    terminal_prompt=None
+    terminal_prompt_policy=None
+    if terminal_merge_enabled:
+        terminal_prompt,terminal_prompt_policy=_terminal_pair_prompt(prompts,pair_start=chunks-2,chunk_seconds=chunk_seconds)
+    reference_storage_plan=None
+    if _reference_routing_runtime is not None and (storage_controller is not None or session is not None):
+        from ..v3.reference_storage_contract import (
+            ReferenceStorageContractError, build_reference_storage_plan,
+        )
+        try:
+            reference_storage_plan=build_reference_storage_plan(
+                runtime=_reference_routing_runtime,
+                prompts=prompts,
+                first_frame_hash=assets.first_frame_hash,
+                last_frame_hash=assets.last_frame_hash,
+                terminal_prompt=terminal_prompt,
+                terminal_prompt_policy=terminal_prompt_policy,
+            )
+        except (ReferenceStorageContractError, ValueError) as exc:
+            raise SequenceRuntimeError(f"RR-R5 Reference plan is invalid: {exc}") from exc
+        _reference_routing_runtime.storage_plan = reference_storage_plan
+    from ..reference import combine_hybrid_visual_identity
+    if _reference_routing_runtime is not None:
+        from ..v3.reference_storage_contract import routed_session_identity
+    visual_identity_hash=(
+        routed_session_identity(assets.identity_hash)
+        if _reference_routing_runtime is not None else
+        combine_hybrid_visual_identity(keyframe_identity_hash=assets.identity_hash,reference_assets=reference_assets,has_first=first_frame is not None,has_last=last_frame is not None)
+    )
+    sequence_identity_hash=combine_reference_audio_identity(visual_identity_hash,reference_audio_source)
+    sequence_identity_hash=combine_driving_audio_identity(sequence_identity_hash,driving_audio_source)
+    sequence_identity_hash=combine_reference_video_identity(sequence_identity_hash,reference_video_source)
+    sequence_identity_hash=combine_timeline_video_identity(sequence_identity_hash,timeline_video_source)
+    sequence_identity_hash=combine_guide_identity(sequence_identity_hash,guide_source)
+    if multi_chunk_flf:
+        sequence_identity_hash=_flf_contract_identity(sequence_identity_hash)
+    sequence_identity_hash=_continuation_transport_identity(sequence_identity_hash,continuation_transport)
+    current_model_fingerprint=model_fingerprint(model,extra_wrapper_keys=("h3_continuum_join.apply_model.v1",))
+    if storage_controller is not None:
+        runtime_coordinator.assert_storage_session_compatible()
+        storage_conditioning_mode=(
+            conditioning_mode_from_presence(
+                has_first=first_frame is not None,
+                has_last=last_frame is not None,
+                has_reference=False,
+            ) if reference_storage_plan is not None else conditioning_mode
+        )
+        stored_session=storage_controller.prepare(model=model,model_fingerprint_value=current_model_fingerprint,clip=clip,video_vae=video_vae,sampler=sampler,sigmas=sigmas,prompt_plan=plan,width=width,height=height,chunk_seconds=chunk_seconds,continuity=continuity,audio_continuity=audio_continuity,base_seed=base_seed,reroll_from_chunk=reroll_from_chunk,reroll_nonce=reroll_nonce,first_frame_hash=assets.first_frame_hash,last_frame_hash=assets.last_frame_hash,identity_hash=sequence_identity_hash,strict_compatibility=strict_compatibility,existing_session=session,reference_contract=reference_assets.contract if reference_assets is not None else None,conditioning_mode=storage_conditioning_mode,reference_audio_contract=reference_audio_source.contract if reference_audio_source is not None else None,reference_audio_vae=reference_audio_vae,driving_audio_contract=driving_audio_source.contract if driving_audio_source is not None else None,driving_audio_vae=driving_audio_vae,reference_video_contract=reference_video_source.contract if reference_video_source is not None else None,timeline_video_contract=timeline_video_source.contract if timeline_video_source is not None else None,guide_contract=guide_source.contract if guide_source is not None else None,execution_semantics=_terminal_execution_semantics(merge_enabled=terminal_merge_enabled,prompt_policy=terminal_prompt_policy,continuation_transport=continuation_transport),reference_storage_plan=reference_storage_plan)
+        reroll_nonce=storage_controller.effective_reroll_nonce
+        review_execution=getattr(storage_controller,"review_execution",None)
+        if review_execution is not None:
+            reroll_from_chunk=int(review_execution.effective_regenerate_from)
+            resolved_group_limit=review_execution.max_new_physical_groups
+            max_new_physical_groups=(
+                0
+                if resolved_group_limit == 0
+                else _physical_group_limit(resolved_group_limit)
+            )
+        if stored_session is not None: session=stored_session
+    accelerators=accelerator_summary(model)
+    if "Continuum APPLY_MODEL wrapper installed" not in accelerators: accelerators+="; Continuum APPLY_MODEL wrapper installed"
+    layout_validation_profiler=(
+        LayoutValidationProfiler(route_markers=accelerators)
+        if diagnostics_mode==DIAGNOSTICS_FULL
+        else None
+    )
+    packed_row_planner=None
+    planner_event=None
+    adaptive_continuity_observer=None
+    adaptive_observer_event=None
+    adaptive_observer_unavailable=None
+    if diagnostics_mode==DIAGNOSTICS_FULL:
+        from ..v3.packed_row_planner import PackedRowPlanner, planner_event_fail_soft
+        packed_row_planner=PackedRowPlanner()
+        planner_event=planner_event_fail_soft
+        try:
+            from ..v3.adaptive_continuity import (
+                AdaptiveContinuityObserver,
+                adaptive_observer_event_fail_soft,
+            )
+            adaptive_continuity_observer=AdaptiveContinuityObserver()
+            adaptive_observer_event=adaptive_observer_event_fail_soft
+        except Exception as exc:
+            adaptive_observer_unavailable=f"{type(exc).__name__}: {exc}"
+    effective_reroll_from_chunk=0 if storage_controller is not None and session is not None and bool((session.get("settings") or {}).get("run_storage_validated_prefix")) else int(reroll_from_chunk)
+    preserved,reuse_notes=_preserved_prefix(session=session,prompt_hashes=prompt_hashes,chunks=chunks,reroll_from_chunk=effective_reroll_from_chunk,width=width,height=height,chunk_seconds=chunk_seconds,identity_hash=sequence_identity_hash,last_frame_hash=assets.last_frame_hash,reference_storage_plan=reference_storage_plan)
+    if _terminal_strategy_mismatch(session,merge_enabled=terminal_merge_enabled):
+        preserved=[]
+        reuse_notes.append("FLF chunk contract changed; regenerated the requested FLF sequence.")
+    if terminal_merge_enabled:
+        preserved,atomic_reset=_atomic_terminal_prefix(preserved,chunks=chunks,reroll_from_chunk=int(reroll_from_chunk))
+        if atomic_reset:
+            reuse_notes.append("terminal merged pair is atomic; regenerated both final logical chunks")
+    if storage_controller is not None:
+        storage_controller.reused_count=len(preserved)
+    if multi_chunk_flf:
+        if terminal_merge_enabled:
+            reuse_notes.insert(0,"FLF execution: terminal merged 10s seed v2; the final two 5-second logical chunks share one physical sample and are split back into normal chunk entries.")
+        else:
+            reuse_notes.insert(0,"FLF execution: terminal merge unavailable for this request; retained one sampling pass per logical chunk.")
+    if reference_assets is not None:
+        reuse_notes.insert(0,f"Reference conditioning: {reference_assets.count} image(s), size={reference_assets.size_mode}; persistent across all chunks.")
+        if reference_warning: reuse_notes.append(reference_warning)
+    if _reference_routing_runtime is not None:
+        reuse_notes.insert(0,
+            "V3.9 Custom Reference routing: group-local conditioning and "
+            "complete-group saved-prefix verification; the verified effective Plan "
+            "is available after Queue."
+            if reference_storage_plan is not None else
+            "V3.9 Custom Reference routing: group-local conditioning."
+        )
+    if reference_audio_source is not None:
+        if isinstance(reference_audio_source, ReferenceAudioBundle):
+            reuse_notes.insert(0,f"Reference Audio conditioning: {reference_audio_source.count} ordered item(s); persistent across all chunks.")
+        else:
+            reuse_notes.insert(0,"Reference Audio 1 conditioning: persistent across all chunks.")
+        if reference_audio_warning: reuse_notes.append(reference_audio_warning)
+    if driving_audio_source is not None:
+        reuse_notes.insert(0,"Driving Audio: absolute-time guide slices enabled; original audio is preserved for final output.")
+    if reference_video_source is not None:
+        if following_video:
+            reuse_notes.insert(0, "Timeline Video: Follow Timeline (Experimental), "
+                "24 fps; physical visible intervals; after source end, no video reference.")
+        else:
+            reuse_notes.insert(0,f"Video Reference conditioning: persistent across all chunks, 24 fps, resolved={reference_video_source.target_width}x{reference_video_source.target_height}, frames={reference_video_source.frame_count}.")
+        if reference_video_warning: reuse_notes.append(reference_video_warning)
+    if timeline_video_source is not None:
+        reuse_notes.insert(0,f"Timeline Video conditioning: chunk-local slices, size={timeline_video_source.size_mode}, resolved={timeline_video_source.target_width}x{timeline_video_source.target_height}.")
+        if timeline_video_warning: reuse_notes.append(timeline_video_warning)
+    if guide_source is not None:
+        reuse_notes.insert(
+            0,
+            "Still Image Guide: absolute frame "
+            f"{guide_source.absolute_frame}; mode={guide_source.contract['mode']}; "
+            f"schema={guide_source.contract['schema_version']}.",
+        )
+    if session is not None:
+        old_fingerprint=str(session.get("model_fingerprint",""))
+        if old_fingerprint and old_fingerprint!=current_model_fingerprint: reuse_notes.append("model/accelerator fingerprint differs from the saved session; accepted chunks were kept")
+
+    # R4: the Coordinator is the sole owner of Storage / Session / State
+    # priority. The Pure Planner receives only its selected-source projection.
+    try:
+        continuation_selection=runtime_coordinator.select_continuation_source(
+            preserved=preserved,
+            initial_state=initial_state,
+            chunks=chunks,
+            width=width,
+            height=height,
+            reroll_from_chunk=int(reroll_from_chunk),
+            effective_reroll_from_chunk=int(effective_reroll_from_chunk),
+            terminal_merge_enabled=terminal_merge_enabled,
+        )
+    except RuntimeCoordinatorError as exc:
+        raise SequenceRuntimeError(str(exc)) from exc
+    entries=continuation_selection.entries
+    previous_state=continuation_selection.previous_state
+    continuation_source_facts=continuation_selection.continuation_source_facts
+    reuse_notes.extend(continuation_selection.notes)
+    retained_review_unit=None
+    inherited_review_unit=(
+        getattr(storage_controller,"inherited_review_unit",None)
+        if storage_controller is not None
+        else None
+    )
+    if isinstance(inherited_review_unit,dict):
+        from ..v3.review_control import ReviewUnit
+        retained_review_unit=ReviewUnit(
+            start=int(inherited_review_unit["start"]),
+            end=int(inherited_review_unit["end"]),
+            physical_group=int(inherited_review_unit["physical_group"]),
+        )
+    from ..v3.execution_planner import ExecutionPlanningError,build_execution_plan
+    try:
+        execution_plan=build_execution_plan(
+            continuation_source_facts=continuation_source_facts,
+            configured_chunks=chunks,
+            terminal_merge_enabled=terminal_merge_enabled,
+            max_new_physical_groups=max_new_physical_groups,
+            review_execution=review_execution,
+            retained_review_unit=retained_review_unit,
+        )
+    except ExecutionPlanningError as exc:
+        raise SequenceRuntimeError(str(exc)) from exc
+    if _reference_routing_runtime is not None:
+        _reference_routing_runtime.generated_groups = tuple(
+            group.physical_group for group in execution_plan.groups_to_generate
+        )
+    if storage_controller is not None:
+        # Queue-local planning result only.  No Run Storage schema or persisted
+        # metadata is changed in R3.
+        storage_controller.execution_plan=execution_plan
+
+    routing_warnings=[]
+
+    def follow_group_cache(group_prompt, include_last, start_frame, net_frames, physical_group=None):
+        # A new prompt-cache dict per physical interval prevents equal-prompt
+        # chunks from accidentally reusing another interval's Qwen conditioning.
+        if _reference_routing_runtime is not None:
+            from ..video_reference_modes import encode_follow_video_group
+            group_video, window = encode_follow_video_group(
+                video_vae, reference_video_source,
+                start_frame=int(start_frame), visible_frames=int(net_frames),
+                cache_enabled=reference_encode_cache,
+                cache_event=reference_encode_cache_events.append,
+            )
+            group_result=_reference_routing_runtime.prepare_group(
+                physical_group=int(physical_group), prompt=group_prompt,
+                clip=clip, video_vae=video_vae,
+                first_image=assets.first_image, last_image=assets.last_image,
+                include_last_image=bool(include_last),
+                reference_audio_assets=reference_audio_assets,
+                timeline_video_assets=group_video,
+                reference_encode_cache=reference_encode_cache,
+                cache_event=reference_encode_cache_events.append,
+                expected_group_contract=(reference_storage_plan.group_for(int(physical_group))
+                                         if reference_storage_plan is not None else None),
+                first_frame_hash=assets.first_frame_hash,
+                last_frame_hash=assets.last_frame_hash,
+                terminal_prompt_policy=None,
+            )
+            routing_warnings.extend(
+                f"RR-R4 Warning: group {physical_group}: {warning}"
+                for warning in group_result.warnings
+            )
+            sampling_reports.append(window.report())
+            key=_conditioning_cache_key(
+                group_prompt, include_last=include_last, reference_assets=None,
+            )
+            return {key: group_result.conditioning}, window.contract
+        group_cache, window = build_follow_group_conditioning(
+            reference_video_source,
+            video_vae,
+            start_frame=int(start_frame),
+            visible_frames=int(net_frames),
+            conditioning_builder=_conditioning_cache,
+            conditioning_kwargs=dict(
+                clip=clip, prompts=[group_prompt], assets=assets,
+                final_has_last_frame=bool(include_last),
+                reference_assets=reference_assets,
+                reference_audio_assets=reference_audio_assets,
+                prompt_conditioning_cache=prompt_conditioning_cache,
+                prompt_cache_event=prompt_cache_events.append,
+            ),
+            cache_enabled=reference_encode_cache,
+            cache_event=reference_encode_cache_events.append,
+        )
+        sampling_reports.append(window.report())
+        return group_cache, window.contract
+
+    cache={}
+    guide_assets=None
+    if len(preserved)<chunks or capture_refine_context:
+        if memory_collector is not None:
+            capture_memory(memory_collector, "start_phase", phase="conditioning")
+            capture_memory(memory_collector, "start_phase", phase="conditioning_identity_video_vae")
+        assets=encode_identity_latents(video_vae,assets)
+        guide_assets=encode_still_image_guide(video_vae,guide_source)
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="conditioning_identity_video_vae")
+        if reference_assets is not None:
+            from ..reference import (
+                encode_reference_latents,
+                encode_reference_latents_cached,
+            )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "start_phase", phase="conditioning_reference_image_vae")
+            if reference_encode_cache:
+                reference_assets=encode_reference_latents_cached(
+                    video_vae,
+                    reference_assets,
+                    cache_event=reference_encode_cache_events.append,
+                )
+            else:
+                reference_assets=encode_reference_latents(video_vae,reference_assets)
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="conditioning_reference_image_vae")
+        reference_audio_assets=None
+        if reference_audio_source is not None:
+            from ..reference_audio import encode_reference_audio_input
+            if memory_collector is not None:
+                capture_memory(memory_collector, "start_phase", phase="conditioning_reference_audio_vae")
+            reference_audio_assets=encode_reference_audio_input(
+                reference_audio_vae,
+                reference_audio_source,
+                cache_enabled=reference_encode_cache,
+                cache_event=reference_encode_cache_events.append,
+            )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="conditioning_reference_audio_vae")
+        if memory_collector is not None and driving_audio_source is not None:
+            capture_memory(memory_collector, "start_phase", phase="conditioning_driving_audio_vae")
+        driving_audio_assets=encode_driving_audio(driving_audio_source,driving_audio_vae)
+        if memory_collector is not None and driving_audio_source is not None:
+            capture_memory(memory_collector, "finish_phase", phase="conditioning_driving_audio_vae")
+        reference_video_assets=None
+        if reference_video_source is not None and not following_video:
+            from ..reference_video import (
+                encode_reference_video,
+                encode_reference_video_cached,
+            )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "start_phase", phase="conditioning_reference_video_vae")
+            if reference_encode_cache:
+                reference_video_assets=encode_reference_video_cached(
+                    video_vae,
+                    reference_video_source,
+                    cache_event=reference_encode_cache_events.append,
+                )
+            else:
+                reference_video_assets=encode_reference_video(
+                    video_vae,
+                    reference_video_source,
+                )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="conditioning_reference_video_vae")
+        if timeline_video_source is None and not following_video and _reference_routing_runtime is None:
+            if memory_collector is not None:
+                capture_memory(memory_collector, "start_phase", phase="conditioning_prompt_clip")
+            planned_normal_indices=tuple(
+                descriptor.logical_chunks[0]-1
+                for descriptor in execution_plan.groups_to_generate
+                if not descriptor.terminal_atomic
+            )
+            if max_new_physical_groups is None:
+                # Preserve the established Full Run conditioning/cache set,
+                # including both logical prompts covered by Terminal Merge.
+                prepared_indices=tuple(range(chunks))
+            elif capture_refine_context:
+                normal_stop=chunks-2 if terminal_merge_enabled else chunks
+                reused_normal_indices=tuple(range(min(len(entries),normal_stop)))
+                prepared_indices=tuple(dict.fromkeys(
+                    reused_normal_indices+planned_normal_indices
+                ))
+            else:
+                prepared_indices=planned_normal_indices
+            prepared_prompts=[prompts[index] for index in prepared_indices]
+            prepare_last=bool(last_frame is not None and (
+                max_new_physical_groups is None or chunks-1 in prepared_indices
+            ))
+            prepare_terminal=any(
+                descriptor.terminal_atomic
+                for descriptor in execution_plan.groups_to_generate
+            ) or bool(
+                capture_refine_context
+                and terminal_merge_enabled
+                and len(entries)==chunks
+            )
+            cache=_conditioning_cache(clip=clip,prompts=prepared_prompts,assets=assets,final_has_last_frame=prepare_last,reference_assets=reference_assets,reference_audio_assets=reference_audio_assets,timeline_video_assets=reference_video_assets,prompt_conditioning_cache=prompt_conditioning_cache,prompt_cache_event=prompt_cache_events.append)
+            if prepare_terminal and terminal_prompt is not None:
+                terminal_key=_conditioning_cache_key(terminal_prompt,include_last=True,reference_assets=reference_assets)
+                if terminal_key not in cache:
+                    cache.update(_conditioning_cache(clip=clip,prompts=[terminal_prompt],assets=assets,final_has_last_frame=True,reference_assets=reference_assets,reference_audio_assets=reference_audio_assets,timeline_video_assets=reference_video_assets,prompt_conditioning_cache=prompt_conditioning_cache,prompt_cache_event=prompt_cache_events.append))
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="conditioning_prompt_clip")
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="conditioning")
+    initial_frame_count=align_frame_count_up(int(round(chunk_seconds*FPS))); retained_frames=sum(int(entry["plan"]["net_frames"]) for entry in entries); sampling_reports=[]
+    context_diagnostics=ContextDiagnosticsTracker() if bool(debug) else None
+    if context_diagnostics is not None:
+        if entries:
+            for reused_entry in entries:
+                _record_context_diagnostics(tracker=context_diagnostics,reports=sampling_reports,state=entry_to_state(reused_entry),continuity=continuity,reused=True)
+        elif previous_state is not None:
+            _record_context_diagnostics(tracker=context_diagnostics,reports=sampling_reports,state=previous_state,continuity=continuity,reused=True)
+    normal_indices=tuple(
+        descriptor.logical_chunks[0]-1
+        for descriptor in execution_plan.groups_to_generate
+        if not descriptor.terminal_atomic
+    )
+    terminal_merge_pending=any(
+        descriptor.terminal_atomic
+        for descriptor in execution_plan.groups_to_generate
+    )
+    # Reuse the same group preparation for context capture; never resample or
+    # recommit accepted entries. An external initial State is not reconstructible
+    # from the saved prefix alone, so retain incomplete-context behavior for it.
+    reused_count=len(entries)
+    rebuild_prefix=bool(capture_refine_context and entries and not entries[0]["plan"]["continuation"])
+    terminal_reused=bool(rebuild_prefix and terminal_merge_enabled and reused_count==chunks)
+    if rebuild_prefix:
+        normal_stop=chunks-2 if terminal_merge_enabled else chunks
+        normal_indices=tuple(range(min(reused_count,normal_stop)))+tuple(normal_indices)
+        previous_state=None
+        retained_frames=0
+    if adaptive_observer_event is not None:
+        adaptive_observer_event(
+            adaptive_continuity_observer,
+            "replay_prefix",
+            entries=entries,
+            total_chunks=chunks,
+            terminal_merge_enabled=terminal_merge_enabled,
+            resolved_transport=continuation_transport,
+        )
+    new_physical_groups=0
+    if memory_collector is not None:
+        capture_memory(memory_collector, "finish_phase", phase="preparation")
+    for sequence_index in normal_indices:
+        reusing_group=sequence_index<reused_count
+        if memory_collector is not None:
+            capture_memory(memory_collector, "start_phase", phase="group_prepare", physical_group=sequence_index+1, logical_chunks=(sequence_index+1,))
+        prompt=prompts[sequence_index]; prompt_hash_value=prompt_hashes[sequence_index]; is_final=sequence_index==chunks-1; effective_reroll_nonce=int(reroll_nonce) if int(reroll_from_chunk)>0 and sequence_index+1>=int(reroll_from_chunk) else 0; seed=derive_chunk_seed(base_seed,sequence_index,effective_reroll_nonce); motion_score=0.0; video_context=None; audio_context=None; context_before=None; context_interop_emitted=False
+        follow_slice_contract = None
+        timeline_video_assets=reference_video_assets
+        chunk_cache=cache
+        if timeline_video_source is not None:
+            from ..timeline_video import encode_timeline_video_chunk
+            if memory_collector is not None:
+                capture_memory(memory_collector, "start_phase", phase="conditioning")
+                capture_memory(memory_collector, "start_phase", phase="conditioning_timeline_video_vae")
+            timeline_video_assets=encode_timeline_video_chunk(video_vae,timeline_video_source,sequence_index)
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="conditioning_timeline_video_vae")
+        chunk_assets=assets
+        if timeline_video_source is not None and _reference_routing_runtime is None:
+            if memory_collector is not None:
+                capture_memory(memory_collector, "start_phase", phase="conditioning_prompt_clip")
+            chunk_cache=_conditioning_cache(clip=clip,prompts=[prompt],assets=assets,final_has_last_frame=bool(last_frame is not None and is_final),reference_assets=reference_assets,reference_audio_assets=reference_audio_assets,timeline_video_assets=timeline_video_assets,prompt_conditioning_cache=prompt_conditioning_cache,prompt_cache_event=prompt_cache_events.append)
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="conditioning_prompt_clip")
+                capture_memory(memory_collector, "finish_phase", phase="conditioning")
+        if _reference_routing_runtime is not None and not following_video:
+            group_result=_reference_routing_runtime.prepare_group(
+                physical_group=sequence_index+1, prompt=prompt,
+                clip=clip, video_vae=video_vae,
+                first_image=assets.first_image, last_image=assets.last_image,
+                include_last_image=bool(last_frame is not None and is_final),
+                reference_audio_assets=reference_audio_assets,
+                timeline_video_assets=timeline_video_assets,
+                reference_encode_cache=reference_encode_cache,
+                cache_event=reference_encode_cache_events.append,
+                prompt_conditioning_cache=bool(
+                    prompt_conditioning_cache and plan["mode"] == PROMPT_MODE_FIXED
+                ),
+                prompt_cache_event=prompt_cache_events.append,
+                expected_group_contract=(reference_storage_plan.group_for(sequence_index+1)
+                                         if reference_storage_plan is not None else None),
+                first_frame_hash=assets.first_frame_hash,
+                last_frame_hash=assets.last_frame_hash,
+                terminal_prompt_policy=None,
+            )
+            routing_warnings.extend(
+                f"RR-R4 Warning: group {sequence_index+1}: {warning}"
+                for warning in group_result.warnings
+            )
+            group_key=_conditioning_cache_key(
+                prompt, include_last=bool(last_frame is not None and is_final),
+                reference_assets=None,
+            )
+            chunk_cache={group_key:group_result.conditioning}
+        if previous_state is None:
+            include_chunk_last=bool(last_frame is not None and is_final)
+            conditioning_key=_conditioning_cache_key(prompt,include_last=include_chunk_last,reference_assets=reference_assets)
+            total_frames=initial_frame_count; latent=empty_h3_latent(width,height,total_frames)
+            if following_video:
+                chunk_cache, follow_slice_contract = follow_group_cache(
+                    prompt, include_chunk_last, retained_frames, total_frames,
+                    physical_group=sequence_index+1,
+                )
+            conditioning=attach_keyframes(chunk_cache[conditioning_key],frame_count=total_frames,first_latent=chunk_assets.first_latent,last_latent=chunk_assets.last_latent if include_chunk_last else None); clip_index=1; context_frames=0
+            chunk_plan=make_plan(continuation=False,clip_index=clip_index,total_frames=total_frames,trim_frames=0,width=width,height=height,context_frames=5,state_capacity_frames=largest_context_capacity(total_frames),requested_extend_seconds=chunk_seconds,debug=debug); reason="initial clip"
+        else:
+            context_frames,motion_score,reason=choose_context_frames(continuity,previous_state); desired_cumulative=int(round((sequence_index+1)*chunk_seconds*FPS)); requested_new_frames=max(1,desired_cumulative-retained_frames); shape=make_extension_shape(context_frames,requested_new_frames/FPS); latent=empty_h3_latent(width,height,shape.total_frames)
+            include_chunk_last=bool(last_frame is not None and is_final)
+            conditioning_key=_conditioning_cache_key(prompt,include_last=include_chunk_last,reference_assets=reference_assets)
+            if following_video:
+                chunk_cache, follow_slice_contract = follow_group_cache(
+                    prompt, include_chunk_last, retained_frames, shape.net_new_frames,
+                    physical_group=sequence_index+1,
+                )
+            continuation_first_latent=None if continuation_transport in (MASKED_VIDEO_PREFIX_V1,MASKED_AV_PREFIX_22_V1,MASKED_AV_PREFIX_39_V1) else chunk_assets.first_latent
+            base_conditioning=attach_keyframes(chunk_cache[conditioning_key],frame_count=shape.total_frames,first_latent=continuation_first_latent,last_latent=chunk_assets.last_latent if include_chunk_last else None)
+            if continuation_transport in (MASKED_VIDEO_PREFIX_V1,MASKED_AV_PREFIX_22_V1,MASKED_AV_PREFIX_39_V1):
+                preserve_audio=continuation_transport in (MASKED_AV_PREFIX_22_V1,MASKED_AV_PREFIX_39_V1)
+                required_context=(22 if continuation_transport == MASKED_AV_PREFIX_22_V1 else 39)
+                if preserve_audio and int(context_frames) != required_context:
+                    raise SequenceRuntimeError(
+                        f"{continuation_transport} requires {required_context}-frame continuity"
+                    )
+                video_context,audio_context,grid_offset=select_context(previous_state,context_frames,include_audio=preserve_audio)
+                context_before=context_fingerprint(video_context,audio_context)
+                if preserve_audio:
+                    from ..v3.masked_continuation import build_masked_av_prefix_latent
+                    latent=build_masked_av_prefix_latent(
+                        latent,
+                        video_context,
+                        audio_context,
+                        context_frames,
+                    )
+                    reason=(
+                        f"{reason}; masked AV target prefix "
+                        f"{context_frames}f/{int(audio_context.shape[-1])}T; "
+                        f"source_audio_grid_offset={float(grid_offset):.6f}"
+                    )
+                else:
+                    from ..v3.masked_continuation import build_masked_video_prefix_latent
+                    latent=build_masked_video_prefix_latent(
+                        latent,
+                        video_context,
+                        context_frames,
+                    )
+                    reason=f"{reason}; masked video target prefix"
+                if _diagnostic_continuation_policy is not None:
+                    latent=_diagnostic_continuation_policy.prepare_masked_latent(
+                        latent=latent,
+                        physical_group=sequence_index+1,
+                        logical_chunks=(sequence_index+1,),
+                        context_frames=context_frames,
+                        video_context=video_context,
+                        audio_context=audio_context,
+                    )
+                conditioning=base_conditioning
+            else:
+                video_context,audio_context,grid_offset=select_context(previous_state,context_frames,include_audio=bool(audio_continuity)); context_before=context_fingerprint(video_context,audio_context)
+                conditioning=prepare_conditioning(base_conditioning,video_context=video_context,audio_context=audio_context,audio_grid_offset=grid_offset,context_frames=context_frames,new_frame_count=shape.total_frames,first_frame_policy=POLICY_REPLACE,preserve_last_frame=True)
+                context_interop_emitted=True
+            clip_index=int(previous_state["clip_index"])+1; chunk_plan=make_plan(continuation=True,clip_index=clip_index,total_frames=shape.total_frames,trim_frames=context_frames,width=width,height=height,context_frames=context_frames,state_capacity_frames=largest_context_capacity(shape.net_new_frames),requested_extend_seconds=chunk_seconds,debug=debug)
+        if follow_slice_contract is not None:
+            chunk_plan[FOLLOW_PLAN_KEY] = follow_slice_contract
+        if adaptive_observer_event is not None and not reusing_group:
+            from ..v3.adaptive_continuity import INITIAL_TRANSPORT
+            adaptive_observer_event(
+                adaptive_continuity_observer,
+                "observe",
+                physical_group=sequence_index+1,
+                logical_chunks=(sequence_index+1,),
+                observed_motion_score=motion_score,
+                current_context_frames=context_frames,
+                resolved_transport=(
+                    INITIAL_TRANSPORT if int(context_frames)==0 else continuation_transport
+                ),
+                terminal_atomic=False,
+                boundary_index=sequence_index,
+                boundary_count=max(0,chunks-1),
+                reason=reason,
+                fallback_reason=None,
+                reused=False,
+            )
+        guide_target=resolve_guide_for_physical_group(
+            guide_source.absolute_frame,
+            target_frames=visible_target_frames,
+            physical_group_index=sequence_index,
+            logical_chunks=(sequence_index+1,),
+            global_visible_start=retained_frames,
+            natural_visible_stop=retained_frames+int(chunk_plan["net_frames"]),
+            context_prefix_frames=int(chunk_plan["trim_frames"]),
+            physical_frames=int(chunk_plan["total_frames"]),
+            terminal_merged=False,
+        ) if guide_source is not None else None
+        conditioning=attach_still_image_guide(conditioning,guide_assets,guide_target)
+        if guide_target is not None:
+            sampling_reports.append(
+                "Still Image Guide: physical_group="
+                f"{guide_target['physical_group_index']+1}, logical_chunks="
+                f"{guide_target['logical_chunks']}, absolute_frame="
+                f"{guide_target['absolute_frame']}, context_prefix="
+                f"{guide_target['context_prefix_frames']}, resolved_frame_index="
+                f"{guide_target['resolved_frame_index']}"
+            )
+        driving_audio_latent=slice_driving_audio_latent(driving_audio_assets,cumulative_retained_before=retained_frames,total_frames=int(chunk_plan["total_frames"]),trim_frames=int(chunk_plan["trim_frames"]),fps=FPS)
+        conditioning=attach_driving_audio(conditioning,driving_audio_latent)
+        clone_kwargs={"strict":bool(strict_compatibility),"debug":bool(debug),"chunk_index":clip_index,"context_frames":context_frames if context_interop_emitted else None}
+        if layout_validation_profiler is not None: clone_kwargs["validation_profiler"]=layout_validation_profiler
+        if packed_row_planner is not None: clone_kwargs["packed_row_planner"]=packed_row_planner
+        if not reusing_group:
+            chunk_model=clone_model_for_chunk(model,**clone_kwargs)
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="group_prepare", physical_group=sequence_index+1, logical_chunks=(sequence_index+1,))
+            capture_memory(memory_collector, "start_phase", phase="refine_context", physical_group=sequence_index+1, logical_chunks=(sequence_index+1,))
+        if bool(capture_refine_context):
+            from ..state import extract_av_streams
+            source_video,_=extract_av_streams(latent)
+            refine_groups.append(make_refine_group(
+                conditioning=conditioning,
+                group_id=len(refine_groups),
+                logical_chunks=(sequence_index+1,),
+                physical_frames=int(chunk_plan["total_frames"]),
+                prompt_policy="single",
+                physical_prompt=prompt,
+                source_video_shape=tuple(int(value) for value in source_video.shape),
+                physical_clip_index=int(clip_index),
+                context_frames=int(context_frames),
+                first_image=assets.first_image,
+                last_image=assets.last_image if include_chunk_last else None,
+                guide_images=(
+                    {
+                        int(guide_target["resolved_frame_index"]): (
+                            guide_assets.source.source_image
+                            if guide_assets.source.source_image is not None
+                            else guide_assets.source.image
+                        )
+                    }
+                    if guide_target is not None and guide_assets is not None
+                    else None
+                ),
+                reference_routing_group_contract=(
+                    _reference_routing_runtime.group_contract_for(sequence_index + 1)
+                    if _reference_routing_runtime is not None else None
+                ),
+            ))
+            del source_video,_
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="refine_context", physical_group=sequence_index+1, logical_chunks=(sequence_index+1,))
+        if reusing_group:
+            previous_state=entry_to_state(entries[sequence_index])
+            retained_frames+=int(entries[sequence_index]["plan"]["net_frames"])
+            del latent,conditioning,chunk_cache
+            if timeline_video_source is not None:
+                del timeline_video_assets
+            continue
+        if memory_collector is not None:
+            capture_memory(memory_collector, "capture_group",
+                physical_group=sequence_index+1,
+                logical_chunks=(sequence_index+1,),
+                stage="before sampling",
+                retained_entries=entries,
+                observed_latent=latent,
+                retained_refine_context=refine_groups,
+            )
+        if memory_collector is not None:
+            capture_memory(memory_collector, "start_phase", phase="sampling", physical_group=sequence_index+1, logical_chunks=(sequence_index+1,))
+        sampled,diagnostic_sample_token=sample_physical_group(
+            sample_callable=sample_chunk,
+            model=chunk_model,
+            conditioning=conditioning,
+            latent=latent,
+            sampler=sampler,
+            sigmas=sigmas,
+            seed=seed,
+            enable_preview=bool(enable_preview),
+            physical_group=sequence_index+1,
+            logical_chunks=(sequence_index+1,),
+            terminal_atomic=False,
+            layout_validation_profiler=layout_validation_profiler,
+            packed_row_planner=packed_row_planner,
+            planner_event=planner_event,
+            diagnostic_policy=_diagnostic_continuation_policy,
+            context_frames=context_frames,
+        )
+        if previous_state is not None and continuation_transport in (MASKED_VIDEO_PREFIX_V1,MASKED_AV_PREFIX_22_V1,MASKED_AV_PREFIX_39_V1):
+            if continuation_transport in (MASKED_AV_PREFIX_22_V1,MASKED_AV_PREFIX_39_V1):
+                from ..v3.masked_continuation import restore_masked_av_prefix
+                sampled=restore_masked_av_prefix(sampled,latent,context_frames)
+            else:
+                from ..v3.masked_continuation import restore_masked_video_prefix
+                sampled=restore_masked_video_prefix(sampled,latent,context_frames)
+        if _diagnostic_continuation_policy is not None:
+            _diagnostic_continuation_policy.after_sampling(
+                token=diagnostic_sample_token,
+                physical_group=sequence_index+1,
+                logical_chunks=(sequence_index+1,),
+                context_frames=context_frames,
+                latent=latent,
+                sampled=sampled,
+                seed=seed,
+                sigmas=sigmas,
+            )
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="sampling", physical_group=sequence_index+1, logical_chunks=(sequence_index+1,))
+        if memory_collector is not None:
+            capture_memory(memory_collector, "capture_group",
+                physical_group=sequence_index+1,
+                logical_chunks=(sequence_index+1,),
+                stage="after sampling",
+                retained_entries=entries,
+                observed_latent=sampled,
+                retained_refine_context=refine_groups,
+            )
+        if memory_collector is not None:
+            capture_memory(memory_collector, "start_phase", phase="cpu_commit_validation", physical_group=sequence_index+1, logical_chunks=(sequence_index+1,))
+        if context_before is not None and video_context is not None: assert_context_unchanged(video_context,audio_context,context_before)
+        entry=make_chunk_entry(latent=sampled,plan=chunk_plan,prompt=prompt,prompt_hash=prompt_hash_value,seed=seed,context_frames=context_frames,motion_score=motion_score,reused=False); previous_state=entry_to_state(entry); entries.append(entry)
+        _record_context_diagnostics(tracker=context_diagnostics,reports=sampling_reports,state=previous_state,continuity=continuity,reused=False)
+        if storage_controller is not None: storage_controller.commit_group((entry,), positions=(sequence_index,))
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="cpu_commit_validation", physical_group=sequence_index+1, logical_chunks=(sequence_index+1,))
+        retained_frames+=int(chunk_plan["net_frames"])
+        sampling_reports.append(f"chunk {sequence_index+1}/{chunks}: seed={seed}, frames={chunk_plan['total_frames']}, trim={chunk_plan['trim_frames']}, retained_total={retained_frames}, context={context_frames} ({reason}), motion={motion_score:.6f}, "+(f"interop=emitted actual_prefix={CONTINUUM_ACTUAL_PREFIX_STEPS} consumer=not_observable" if context_interop_emitted else "interop=not_emitted"))
+        del sampled,latent,conditioning,chunk_model,chunk_cache
+        if timeline_video_source is not None and timeline_video_assets is not None: del timeline_video_assets
+        if memory_collector is not None:
+            capture_memory(memory_collector, "capture_group",
+                physical_group=sequence_index+1,
+                logical_chunks=(sequence_index+1,),
+                stage="after CPU commit",
+                retained_entries=entries,
+                retained_refine_context=refine_groups,
+            )
+        mark_review_group=getattr(storage_controller,"mark_review_group",None)
+        if callable(mark_review_group):
+            mark_review_group(
+                start=sequence_index+1,
+                end=sequence_index+1,
+                physical_group=sequence_index+1,
+            )
+        new_physical_groups+=1
+    if terminal_reused or terminal_merge_pending:
+        pair_start=chunks-2
+        if len(entries)!=(chunks if terminal_reused else pair_start):
+            raise SequenceRuntimeError(f"terminal merged pair expected {pair_start} completed chunks, got {len(entries)}")
+        terminal_physical_group=pair_start+1
+        terminal_logical_chunks=(pair_start+1,chunks)
+        if memory_collector is not None:
+            capture_memory(memory_collector, "start_phase", phase="group_prepare", physical_group=terminal_physical_group, logical_chunks=terminal_logical_chunks)
+        prompt=terminal_prompt
+        seed_nonce=int(reroll_nonce) if int(reroll_from_chunk)>0 else 0
+        terminal_seed_plan=_terminal_physical_seed_plan(base_seed=base_seed,physical_window_start_index=pair_start,reroll_nonce=seed_nonce)
+        physical_seed=int(terminal_seed_plan["physical_seed"])
+        initial_pair=previous_state is None
+        contract=_terminal_pair_contract(initial_pair=initial_pair,chunk_seconds=chunk_seconds)
+        physical_frames=int(contract["physical_frames"])
+        physical_context_frames=int(contract["physical_context_frames"])
+        terminal_masked=bool(
+            not initial_pair
+            and continuation_transport in (
+                MASKED_VIDEO_PREFIX_V1,
+                MASKED_AV_PREFIX_22_V1,
+            )
+        )
+        if not initial_pair and continuation_transport==MASKED_AV_PREFIX_39_V1:
+            raise SequenceRuntimeError(
+                "masked_av_prefix_39_v1 is not defined for the 22-frame "
+                "Long Terminal Merge contract"
+            )
+        latent=empty_h3_latent(width,height,physical_frames)
+        conditioning_key=_conditioning_cache_key(prompt,include_last=True,reference_assets=reference_assets)
+        terminal_cache = cache
+        terminal_follow_slice = None
+        if _reference_routing_runtime is not None:
+            terminal_video_assets=reference_video_assets
+            if following_video:
+                from ..video_reference_modes import encode_follow_video_group
+                terminal_video_assets, window=encode_follow_video_group(
+                    video_vae, reference_video_source,
+                    start_frame=int(retained_frames),
+                    visible_frames=physical_frames-physical_context_frames,
+                    cache_enabled=reference_encode_cache,
+                    cache_event=reference_encode_cache_events.append,
+                )
+                terminal_follow_slice=window.contract
+                sampling_reports.append(window.report())
+            group_result=_reference_routing_runtime.prepare_group(
+                physical_group=terminal_physical_group, prompt=prompt,
+                clip=clip, video_vae=video_vae,
+                first_image=assets.first_image, last_image=assets.last_image,
+                include_last_image=True,
+                reference_audio_assets=reference_audio_assets,
+                timeline_video_assets=terminal_video_assets,
+                reference_encode_cache=reference_encode_cache,
+                cache_event=reference_encode_cache_events.append,
+                expected_group_contract=(reference_storage_plan.group_for(terminal_physical_group)
+                                         if reference_storage_plan is not None else None),
+                first_frame_hash=assets.first_frame_hash,
+                last_frame_hash=assets.last_frame_hash,
+                terminal_prompt_policy=terminal_prompt_policy,
+            )
+            routing_warnings.extend(
+                f"RR-R4 Warning: group {terminal_physical_group}: {warning}"
+                for warning in group_result.warnings
+            )
+            terminal_cache={conditioning_key:group_result.conditioning}
+        elif following_video:
+            terminal_cache, terminal_follow_slice = follow_group_cache(
+                prompt, True, retained_frames,
+                physical_frames - physical_context_frames,
+            )
+        base_conditioning=attach_keyframes(
+            terminal_cache[conditioning_key],
+            frame_count=physical_frames,
+            first_latent=None if terminal_masked else assets.first_latent,
+            last_latent=assets.last_latent,
+        )
+        video_context=None; audio_context=None; context_before=None; motion_score=0.0
+        if initial_pair:
+            conditioning=base_conditioning
+            physical_clip_index=1
+            reason="terminal merged initial 10-second sample"
+        else:
+            selected_context,motion_score,selected_reason=choose_context_frames(continuity,previous_state)
+            masked_audio=terminal_masked and continuation_transport==MASKED_AV_PREFIX_22_V1
+            video_context,audio_context,grid_offset=select_context(
+                previous_state,
+                TERMINAL_MERGE_CONTEXT_FRAMES,
+                include_audio=bool(audio_continuity) if not terminal_masked else masked_audio,
+            )
+            context_before=context_fingerprint(video_context,audio_context)
+            if terminal_masked:
+                if masked_audio:
+                    from ..v3.masked_continuation import build_masked_av_prefix_latent
+                    latent=build_masked_av_prefix_latent(
+                        latent,
+                        video_context,
+                        audio_context,
+                        TERMINAL_MERGE_CONTEXT_FRAMES,
+                    )
+                    reason=(
+                        "terminal merged 10-second sample with masked AV target "
+                        "prefix 22f/37T; no Continuum Reference rows"
+                    )
+                else:
+                    from ..v3.masked_continuation import build_masked_video_prefix_latent
+                    latent=build_masked_video_prefix_latent(
+                        latent,
+                        video_context,
+                        TERMINAL_MERGE_CONTEXT_FRAMES,
+                    )
+                    reason=(
+                        "terminal merged 10-second sample with masked video "
+                        "target prefix 22f/7T; no Continuum Reference rows"
+                    )
+                conditioning=base_conditioning
+            else:
+                conditioning=prepare_conditioning(base_conditioning,video_context=video_context,audio_context=audio_context,audio_grid_offset=grid_offset,context_frames=TERMINAL_MERGE_CONTEXT_FRAMES,new_frame_count=physical_frames,first_frame_policy=POLICY_REPLACE,preserve_last_frame=True)
+                reason=f"terminal merged 10-second sample with 22-frame context; continuity selection was {selected_context} ({selected_reason})"
+            physical_clip_index=int(previous_state["clip_index"])+1
+        if adaptive_observer_event is not None and not terminal_reused:
+            from ..v3.adaptive_continuity import INITIAL_TRANSPORT
+            adaptive_observer_event(
+                adaptive_continuity_observer,
+                "observe",
+                physical_group=terminal_physical_group,
+                logical_chunks=terminal_logical_chunks,
+                observed_motion_score=motion_score,
+                current_context_frames=physical_context_frames,
+                resolved_transport=(
+                    INITIAL_TRANSPORT
+                    if int(physical_context_frames)==0
+                    else continuation_transport
+                ),
+                terminal_atomic=True,
+                boundary_index=pair_start,
+                boundary_count=max(0,chunks-1),
+                reason=reason,
+                fallback_reason=None,
+                reused=False,
+            )
+        guide_target=resolve_guide_for_physical_group(
+            guide_source.absolute_frame,
+            target_frames=visible_target_frames,
+            physical_group_index=terminal_physical_group-1,
+            logical_chunks=terminal_logical_chunks,
+            global_visible_start=retained_frames,
+            natural_visible_stop=(
+                retained_frames+physical_frames-physical_context_frames
+            ),
+            context_prefix_frames=physical_context_frames,
+            physical_frames=physical_frames,
+            terminal_merged=True,
+        ) if guide_source is not None else None
+        conditioning=attach_still_image_guide(conditioning,guide_assets,guide_target)
+        if guide_target is not None:
+            sampling_reports.append(
+                "Still Image Guide: physical_group="
+                f"{guide_target['physical_group_index']+1}, logical_chunks="
+                f"{guide_target['logical_chunks']}, absolute_frame="
+                f"{guide_target['absolute_frame']}, context_prefix="
+                f"{guide_target['context_prefix_frames']}, resolved_frame_index="
+                f"{guide_target['resolved_frame_index']}, terminal_merged=true"
+            )
+        driving_audio_latent=slice_driving_audio_latent(driving_audio_assets,cumulative_retained_before=retained_frames,total_frames=physical_frames,trim_frames=physical_context_frames,fps=FPS)
+        conditioning=attach_driving_audio(conditioning,driving_audio_latent)
+        if not terminal_reused:
+            chunk_model=clone_model_for_chunk(
+                model,
+                strict=bool(strict_compatibility),
+                debug=bool(debug),
+                chunk_index=physical_clip_index,
+                context_frames=(
+                    physical_context_frames
+                    if not initial_pair and not terminal_masked
+                    else None
+                ),
+                **(
+                    {"validation_profiler": layout_validation_profiler}
+                    if layout_validation_profiler is not None
+                    else {}
+                ),
+                **(
+                    {"packed_row_planner": packed_row_planner}
+                    if packed_row_planner is not None
+                    else {}
+                ),
+            )
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="group_prepare", physical_group=terminal_physical_group, logical_chunks=terminal_logical_chunks)
+            capture_memory(memory_collector, "start_phase", phase="refine_context", physical_group=terminal_physical_group, logical_chunks=terminal_logical_chunks)
+        if bool(capture_refine_context):
+            from ..state import extract_av_streams
+            source_video,_=extract_av_streams(latent)
+            refine_groups.append(make_refine_group(
+                conditioning=conditioning,
+                group_id=len(refine_groups),
+                logical_chunks=(pair_start+1,chunks),
+                physical_frames=physical_frames,
+                prompt_policy=str(terminal_prompt_policy),
+                physical_prompt=str(prompt),
+                source_video_shape=tuple(int(value) for value in source_video.shape),
+                physical_clip_index=int(physical_clip_index),
+                context_frames=int(physical_context_frames),
+                first_image=None if terminal_masked else assets.first_image,
+                last_image=assets.last_image,
+                guide_images=(
+                    {
+                        int(guide_target["resolved_frame_index"]): (
+                            guide_assets.source.source_image
+                            if guide_assets.source.source_image is not None
+                            else guide_assets.source.image
+                        )
+                    }
+                    if guide_target is not None and guide_assets is not None
+                    else None
+                ),
+                reference_routing_group_contract=(
+                    _reference_routing_runtime.group_contract_for(terminal_physical_group)
+                    if _reference_routing_runtime is not None else None
+                ),
+            ))
+            del source_video,_
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="refine_context", physical_group=terminal_physical_group, logical_chunks=terminal_logical_chunks)
+        if not terminal_reused:
+            if memory_collector is not None:
+                capture_memory(memory_collector, "capture_group",
+                    physical_group=terminal_physical_group,
+                    logical_chunks=terminal_logical_chunks,
+                    stage="before sampling",
+                    retained_entries=entries,
+                    observed_latent=latent,
+                    retained_refine_context=refine_groups,
+                )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "start_phase", phase="sampling", physical_group=terminal_physical_group, logical_chunks=terminal_logical_chunks)
+            sampled,_=sample_physical_group(
+                sample_callable=sample_chunk,
+                model=chunk_model,
+                conditioning=conditioning,
+                latent=latent,
+                sampler=sampler,
+                sigmas=sigmas,
+                seed=physical_seed,
+                enable_preview=bool(enable_preview),
+                physical_group=terminal_physical_group,
+                logical_chunks=terminal_logical_chunks,
+                terminal_atomic=True,
+                layout_validation_profiler=layout_validation_profiler,
+                packed_row_planner=packed_row_planner,
+                planner_event=planner_event,
+            )
+            if terminal_masked:
+                if continuation_transport==MASKED_AV_PREFIX_22_V1:
+                    from ..v3.masked_continuation import restore_masked_av_prefix
+                    sampled=restore_masked_av_prefix(
+                        sampled,
+                        latent,
+                        TERMINAL_MERGE_CONTEXT_FRAMES,
+                    )
+                else:
+                    from ..v3.masked_continuation import restore_masked_video_prefix
+                    sampled=restore_masked_video_prefix(
+                        sampled,
+                        latent,
+                        TERMINAL_MERGE_CONTEXT_FRAMES,
+                    )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="sampling", physical_group=terminal_physical_group, logical_chunks=terminal_logical_chunks)
+            if memory_collector is not None:
+                capture_memory(memory_collector, "capture_group",
+                    physical_group=terminal_physical_group,
+                    logical_chunks=terminal_logical_chunks,
+                    stage="after sampling",
+                    retained_entries=entries,
+                    observed_latent=sampled,
+                    retained_refine_context=refine_groups,
+                )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "start_phase", phase="cpu_commit_validation", physical_group=terminal_physical_group, logical_chunks=terminal_logical_chunks)
+            if context_before is not None and video_context is not None:
+                assert_context_unchanged(video_context,audio_context,context_before)
+            sampled_video,sampled_audio=latent_to_cpu(sampled)
+            logical_parts=_split_terminal_merged_latents(sampled_video,sampled_audio,contract)
+            sampling_reports.append(f"terminal physical sample: terminal_pair={pair_start+1}-{chunks}, physical_seed={physical_seed}, physical_frames={physical_frames}, sampling_passes=1, shared_physical_sample=true, terminal_prompt_policy={terminal_prompt_policy}, trim={physical_context_frames}, reason={reason}")
+            terminal_commit_entries=[]
+            terminal_commit_positions=[]
+            for offset,(video_part,audio_part) in enumerate(logical_parts):
+                sequence_index=pair_start+offset
+                total_frames=int(contract["logical_frames"][offset])
+                trim_frames=int(contract["logical_trims"][offset])
+                continuation=bool(trim_frames)
+                clip_index=physical_clip_index+offset
+                context_frames=trim_frames if continuation else 5
+                chunk_plan=make_plan(continuation=continuation,clip_index=clip_index,total_frames=total_frames,trim_frames=trim_frames,width=width,height=height,context_frames=context_frames,state_capacity_frames=largest_context_capacity(total_frames-trim_frames),requested_extend_seconds=chunk_seconds,debug=debug)
+                if terminal_follow_slice is not None:
+                    chunk_plan[FOLLOW_PLAN_KEY] = dict(terminal_follow_slice)
+                logical_latent=latent_from_cpu(video_part,audio_part)
+                logical_seed=int(terminal_seed_plan["logical_entry_seeds"][offset])
+                entry=make_chunk_entry(latent=logical_latent,plan=chunk_plan,prompt=prompts[sequence_index],prompt_hash=prompt_hashes[sequence_index],seed=logical_seed,context_frames=trim_frames,motion_score=motion_score,reused=False)
+                entries.append(entry)
+                previous_state=entry_to_state(entry)
+                _record_context_diagnostics(tracker=context_diagnostics,reports=sampling_reports,state=previous_state,continuity=continuity,reused=False)
+                terminal_commit_entries.append(entry)
+                terminal_commit_positions.append(sequence_index)
+                retained_frames+=int(chunk_plan["net_frames"])
+                sampling_reports.append(f"chunk {sequence_index+1}/{chunks}: seed={logical_seed}, frames={total_frames}, trim={trim_frames}, retained_total={retained_frames}, context={trim_frames}, shared_physical_sample=terminal_10s_seed_v2")
+                del logical_latent
+            if storage_controller is not None:
+                storage_controller.commit_group(
+                    tuple(terminal_commit_entries),
+                    positions=tuple(terminal_commit_positions),
+                )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="cpu_commit_validation", physical_group=terminal_physical_group, logical_chunks=terminal_logical_chunks)
+            del sampled,sampled_video,sampled_audio,logical_parts,latent,conditioning,chunk_model
+            del video_part,audio_part
+            if memory_collector is not None:
+                capture_memory(memory_collector, "capture_group",
+                    physical_group=terminal_physical_group,
+                    logical_chunks=terminal_logical_chunks,
+                    stage="after CPU commit",
+                    retained_entries=entries,
+                    retained_refine_context=refine_groups,
+                )
+            mark_review_group=getattr(storage_controller,"mark_review_group",None)
+            if callable(mark_review_group):
+                mark_review_group(
+                    start=pair_start+1,
+                    end=chunks,
+                    physical_group=terminal_physical_group,
+                )
+            new_physical_groups+=1
+        else:
+            del latent,conditioning
+    if memory_collector is not None:
+        capture_memory(memory_collector, "start_phase", phase="finalization")
+    if layout_validation_profiler is not None:
+        sampling_reports.extend(layout_validation_profiler.report_lines())
+    if planner_event is not None:
+        packed_row_lines=planner_event(packed_row_planner,"report_lines")
+        if packed_row_lines:
+            sampling_reports.extend(packed_row_lines)
+    if adaptive_observer_event is not None:
+        adaptive_lines=adaptive_observer_event(
+            adaptive_continuity_observer,
+            "report_lines",
+        )
+        if adaptive_lines:
+            sampling_reports.extend(adaptive_lines)
+    elif adaptive_observer_unavailable is not None:
+        sampling_reports.append(
+            "Adaptive Continuity observer [A8a v1]: unavailable/advisory="
+            f"{adaptive_observer_unavailable}; execution_applied=false; "
+            "Production continuity unchanged."
+        )
+    sequence_complete=len(entries)==chunks
+    if len(entries)>chunks or (not sequence_complete and max_new_physical_groups is None):
+        raise SequenceRuntimeError(f"internal sequence length mismatch: expected {chunks}, got {len(entries)}")
+    if not entries:
+        raise SequenceRuntimeError("physical review execution returned an empty prefix")
+    if _reference_routing_runtime is not None:
+        from ..v3.reference_storage_contract import (
+            ReferenceStorageContractError, build_reference_storage_plan,
+            session_routing_settings,
+        )
+        if reference_storage_plan is None:
+            try:
+                reference_storage_plan=build_reference_storage_plan(
+                    runtime=_reference_routing_runtime,
+                    prompts=prompts,
+                    first_frame_hash=assets.first_frame_hash,
+                    last_frame_hash=assets.last_frame_hash,
+                    terminal_prompt=terminal_prompt,
+                    terminal_prompt_policy=terminal_prompt_policy,
+                    through_chunk=len(entries),
+                )
+            except (ReferenceStorageContractError, ValueError) as exc:
+                raise SequenceRuntimeError(f"RR-R5 accepted Session evidence is invalid: {exc}") from exc
+        routed_session_settings=session_routing_settings(reference_storage_plan,len(entries))
+        _reference_routing_runtime.storage_plan = reference_storage_plan
+        _reference_routing_runtime.accepted_chunks = len(entries)
+    if latent_only:
+        last_state=entry_to_state(entries[-1]); parent_id=session.get("session_id") if session is not None else None
+        settings={"continuity":continuity,"audio_continuity":bool(audio_continuity),"exact_total_duration":False,"prompt_mode":plan["mode"],"conditioning_mode":conditioning_mode,"base_seed":int(base_seed),"reroll_nonce":int(reroll_nonce),"diagnostics_mode":diagnostics_mode,"initial_state_source":initial_state is not None,"latent_first":True,"first_frame_hash":assets.first_frame_hash,"last_frame_hash":assets.last_frame_hash,"reference_contract":reference_assets.contract if reference_assets is not None else None}
+        if multi_chunk_flf: settings["flf_execution"]=FLF_STRATEGY
+        if continuation_transport!=REFERENCE_CONTEXT_V1: settings["continuation_transport"]=continuation_transport
+        if reference_audio_source is not None: settings["reference_audio_contract"]=reference_audio_source.contract
+        if driving_audio_source is not None: settings["driving_audio_contract"]=driving_audio_source.contract
+        if reference_video_source is not None: settings["reference_video_contract"]=reference_video_source.contract
+        if timeline_video_source is not None: settings["timeline_video_contract"]=timeline_video_source.contract
+        if guide_source is not None: settings["guide_contract"]=dict(guide_source.contract)
+        if reference_storage_plan is not None: settings["reference_routing_v1"]=routed_session_settings
+        new_session=make_session(chunks=entries,width=width,height=height,chunk_seconds=chunk_seconds,identity_hash=sequence_identity_hash,model_fingerprint_value=current_model_fingerprint,parent_session_id=parent_id,reroll_from_chunk=int(reroll_from_chunk),settings=settings)
+        report_lines=[f"H3 Continuum V3 {PACKAGE_VERSION}",f"Conditioning mode: {conditioning_display}.",prompt_plan_report(plan),"Decode: external ComfyUI Core VAE nodes; full raw AV chunks retained.",accelerators,"Execution: conditioning precomputed; single call-local MODEL clone per chunk; no internal VAE decode.",*reuse_notes,*routing_warnings]
+        if max_new_physical_groups is not None:
+            report_lines.append(
+                "Physical review execution: "
+                f"{new_physical_groups} new physical group(s) completed; "
+                f"{len(entries)}/{chunks} logical chunks available."
+            )
+        if diagnostics_mode!=DIAGNOSTICS_OFF: report_lines.extend(sampling_reports)
+        if prompt_conditioning_cache and diagnostics_mode==DIAGNOSTICS_FULL:
+            report_lines.append(_prompt_cache_diagnostics(prompt_cache_events))
+        if reference_encode_cache and diagnostics_mode==DIAGNOSTICS_FULL:
+            from ..v3.ref_encode_cache import format_ref_encode_cache_diagnostics
+            cache_report=format_ref_encode_cache_diagnostics(reference_encode_cache_events)
+            if cache_report:
+                report_lines.append(cache_report)
+        report_lines.extend([session_summary(new_session),f"Output: {len(entries)} raw AV latent chunk(s); connect Core VAE Decode nodes, then H3 Continuum Assemble V3."])
+        outputs=(entries,last_state,new_session,"\n".join(report_lines))
+        if bool(capture_refine_context):
+            expected_groups=chunks-(1 if terminal_merge_enabled else 0)
+            complete=len(refine_groups)==expected_groups
+            notes=[]
+            if not complete:
+                if not sequence_complete:
+                    notes.append(
+                        "Refine context is incomplete because physical review execution "
+                        f"returned {len(entries)}/{chunks} logical chunks; captured "
+                        f"{len(refine_groups)} of {expected_groups} physical sampling groups."
+                    )
+                else:
+                    notes.append(
+                        "Refine context is incomplete because accepted session/Run Storage "
+                        f"entries were reused; captured {len(refine_groups)} of "
+                        f"{expected_groups} physical sampling groups."
+                    )
+            raw_refine_context=make_refine_context(
+                refine_groups,
+                source_width=width,
+                source_height=height,
+                conditioning_mode=conditioning_mode,
+                complete=complete,
+                notes=notes,
+            )
+            if memory_collector is not None:
+                capture_memory(memory_collector, "finish_phase", phase="finalization")
+            return (*outputs,raw_refine_context)
+        if memory_collector is not None:
+            capture_memory(memory_collector, "finish_phase", phase="finalization")
+        return outputs
+    if seam_correction==SEAM_CORRECTION_OFF: images,audio,decode_reports=decode_sequence(entries=entries,video_vae=video_vae,audio_vae=audio_vae,diagnostics_full=diagnostics_mode==DIAGNOSTICS_FULL)
+    else: images,audio,decode_reports=decode_sequence_with_seam(entries=entries,video_vae=video_vae,audio_vae=audio_vae,diagnostics_mode=diagnostics_mode,automatic=seam_correction==SEAM_CORRECTION_AUTO)
+    duration_report=""
+    if exact_total_duration:
+        target_frames=int(round(chunks*chunk_seconds*FPS)); images,audio,duration_report=enforce_total_frames(images,audio,target_frames=target_frames,preserve_final_frame=last_frame is not None)
+    last_state=entry_to_state(entries[-1]); parent_id=session.get("session_id") if session is not None else None
+    settings={"continuity":continuity,"audio_continuity":bool(audio_continuity),"exact_total_duration":bool(exact_total_duration),"prompt_mode":plan["mode"],"base_seed":int(base_seed),"reroll_nonce":int(reroll_nonce),"diagnostics_mode":diagnostics_mode,"initial_state_source":initial_state is not None,"first_frame_hash":assets.first_frame_hash,"last_frame_hash":assets.last_frame_hash,"reference_contract":reference_assets.contract if reference_assets is not None else None}
+    if multi_chunk_flf: settings["flf_execution"]=FLF_STRATEGY
+    if continuation_transport!=REFERENCE_CONTEXT_V1: settings["continuation_transport"]=continuation_transport
+    if guide_source is not None: settings["guide_contract"]=dict(guide_source.contract)
+    if reference_storage_plan is not None: settings["reference_routing_v1"]=routed_session_settings
+    new_session=make_session(chunks=entries,width=width,height=height,chunk_seconds=chunk_seconds,identity_hash=sequence_identity_hash,model_fingerprint_value=current_model_fingerprint,parent_session_id=parent_id,reroll_from_chunk=int(reroll_from_chunk),settings=settings)
+    decoded_gib=float(images.shape[0])*float(width)*float(height)*3.0*4.0/(1024.0**3)
+    report_lines=[f"H3 Continuum V2 {PACKAGE_VERSION}",prompt_plan_report(plan),f"Seam correction: {seam_correction}.",accelerators,"Execution: conditioning precomputed; single call-local MODEL clone per chunk; decode deferred until sampling completed.",*reuse_notes,*routing_warnings]
+    if diagnostics_mode!=DIAGNOSTICS_OFF: report_lines.extend([f"Decode RAM estimate: {decode_estimate_gib:.2f} GiB including transient headroom"+(f"; available at start {available_ram_gib:.2f} GiB." if available_ram_gib is not None else "."),*sampling_reports,*decode_reports])
+    if duration_report: report_lines.append(duration_report)
+    report_lines.extend([session_summary(new_session),f"Output: {images.shape[0]} frames ({images.shape[0]/FPS:.3f}s), audio samples={audio['waveform'].shape[-1]}, decoded tensor≈{decoded_gib:.2f} GiB."])
+    return images,audio,last_state,new_session,"\n".join(report_lines)
+# V3.0.1 hardening integration: Detailed Report only; generation semantics unchanged.
+from ..hardening import run_sequence_with_hardening as _run_sequence_with_hardening
+
+
+def run_sequence(*,model:Any,clip:Any,video_vae:Any,audio_vae:Any,sampler:Any,sigmas:torch.Tensor,first_frame:torch.Tensor|None,last_frame:torch.Tensor|None,prompt_plan:dict[str,Any],width:int,height:int,continuity:str,base_seed:int,audio_continuity:bool,exact_total_duration:bool,diagnostics_mode:str,reroll_from_chunk:int,reroll_nonce:int,strict_compatibility:bool,debug:bool,seam_correction:str=SEAM_CORRECTION_OFF,enable_preview:bool=True,session:dict[str,Any]|None=None,initial_state:dict[str,Any]|None=None,latent_only:bool=False,reference_assets=None,reference_audio_source=None,reference_audio_vae=None,driving_audio_source=None,driving_audio_vae=None,reference_video_source=None,timeline_video_source=None,guide_source=None,capture_refine_context:bool=False,memory_attribution:bool=False,prompt_conditioning_cache:bool=False,reference_encode_cache:bool=False,continuation_transport:str=REFERENCE_CONTEXT_V1,max_new_physical_groups:int|None=None,_memory_attribution_collector:Any=None,_diagnostic_continuation_policy:Any=None):
+    """Signature-compatible adapter into the R4 internal runtime."""
+
+    return _run_sequence_with_hardening(
+        _run_runtime_internal,
+        (),
+        {
+            "model":model,
+            "clip":clip,
+            "video_vae":video_vae,
+            "audio_vae":audio_vae,
+            "sampler":sampler,
+            "sigmas":sigmas,
+            "first_frame":first_frame,
+            "last_frame":last_frame,
+            "prompt_plan":prompt_plan,
+            "width":width,
+            "height":height,
+            "continuity":continuity,
+            "base_seed":base_seed,
+            "audio_continuity":audio_continuity,
+            "exact_total_duration":exact_total_duration,
+            "diagnostics_mode":diagnostics_mode,
+            "reroll_from_chunk":reroll_from_chunk,
+            "reroll_nonce":reroll_nonce,
+            "strict_compatibility":strict_compatibility,
+            "debug":debug,
+            "seam_correction":seam_correction,
+            "enable_preview":enable_preview,
+            "session":session,
+            "initial_state":initial_state,
+            "latent_only":latent_only,
+            "reference_assets":reference_assets,
+            "reference_audio_source":reference_audio_source,
+            "reference_audio_vae":reference_audio_vae,
+            "driving_audio_source":driving_audio_source,
+            "driving_audio_vae":driving_audio_vae,
+            "reference_video_source":reference_video_source,
+            "timeline_video_source":timeline_video_source,
+            "guide_source":guide_source,
+            "capture_refine_context":capture_refine_context,
+            "memory_attribution":memory_attribution,
+            "prompt_conditioning_cache":prompt_conditioning_cache,
+            "reference_encode_cache":reference_encode_cache,
+            "continuation_transport":continuation_transport,
+            "max_new_physical_groups":max_new_physical_groups,
+            "_memory_attribution_collector":_memory_attribution_collector,
+            "_diagnostic_continuation_policy":_diagnostic_continuation_policy,
+        },
+    )
+
+
+def run_sequence_with_reference_routing(*, reference_routing_runtime, **sequence_kwargs):
+    """RR-R4-only caller; do not expose through the V3.8 public node."""
+
+    token = _REFERENCE_ROUTING_RUNTIME.set(reference_routing_runtime)
+    try:
+        return run_sequence(**sequence_kwargs)
+    finally:
+        _REFERENCE_ROUTING_RUNTIME.reset(token)
