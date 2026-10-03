@@ -19,7 +19,7 @@ const start = {comfyClass: 'H3ContinuumExternalSequenceStart_design61', widgets:
 globalThis.app = {registerExtension: value => extension = value, queuePrompt: async () => queued = start.widgets.map(item => item.value)};
 """ + source + """
 class End {
-  constructor() {this.widgets=[];}
+  constructor() {this.widgets=[];this.inputs=[{name:'flow',link:7}];}
   getInputNode() {return start;}
   addWidget(type,name,value,callback,options) {const widget={type,name,value,callback,options}; this.widgets.push(widget); return widget;}
   computeSize() {return [300,200];}
@@ -48,6 +48,35 @@ await end.widgets.find(item=>item.name==='Finish here').callback();
 if(JSON.stringify(queued)!==JSON.stringify(['Finish here','rs'])) throw Error('Finish command changed to running remaining chunks');
 await end.widgets.find(item=>item.name==='Start again from Chunk 1').callback();
 if(queued[0]!=='Start again from Chunk 1') throw Error('Restart all command missing');
+// Multiple legacy Reroute nodes must resolve the same controller. Callback
+// bindings must also survive changing connections and replacing Start widgets.
+const routed=new End();
+const route1={id:101,type:'Reroute',inputs:[{name:'',link:8}],getInputNode(){return route2;}};
+const route2={id:102,type:'Reroute',inputs:[{name:'',link:9}],getInputNode(){return start;}};
+routed.getInputNode=()=>route1;
+routed.onExecuted({external_review:[{mode:'Review Each Chunk',status:'review_ready',revision:'rerouted-revision',accepted:1,chunks:2,history:[{revision:'take-routed',chunk:1,seed:3}]}]});
+for(const name of ['Use it and continue','Finish here','Try this chunk again','Start again from Chunk 1']) {
+  queued=null;
+  start.widgets=[{name:'review_action',value:'Start / Resume'},{name:'expected_revision',value:''}];
+  await routed.widgets.find(item=>item.name===name).callback();
+  if(JSON.stringify(queued)!==JSON.stringify([name,'rerouted-revision'])) throw Error('Rerouted '+name+' failed');
+}
+const historyButton=routed.widgets.find(item=>item.name.startsWith('Render History'));
+historyButton.callback();
+if(!routed.widgets.some(item=>item.name==='Saved Takes')) throw Error('History failed to open');
+historyButton.callback();
+if(routed.widgets.some(item=>item.name==='Saved Takes')) throw Error('History failed to close');
+route2.getInputNode=()=>route1;
+if(findExternalSequenceStart(routed)!==null) throw Error('Cyclic flow hung or chose unrelated Start');
+queued=null;
+await routed.widgets.find(item=>item.name==='Use it and continue').callback();
+if(queued!==null||!routed.widgets.find(item=>item.name==='Review status').value.includes('Cannot find')) throw Error('Missing controller failed silently');
+route2.getInputNode=()=>start;
+const originalQueue=app.queuePrompt;
+app.queuePrompt=async()=>{throw Error('synthetic queue failure');};
+await routed.widgets.find(item=>item.name==='Use it and continue').callback();
+if(!routed.widgets.find(item=>item.name==='Review status').value.includes('synthetic queue failure')) throw Error('Queue error failed silently');
+app.queuePrompt=originalQueue;
 class Start {constructor(){this.widgets=[{name:'chunks',value:4},{name:'chunk_seconds',value:5},{name:'generation_mode',value:'Review by Chunk'},{name:'review_action',value:'Start / Resume',type:'combo'},{name:'expected_revision',value:'',type:'text'}];}}
 await extension.beforeRegisterNodeDef(Start,{name:'H3ContinuumExternalSequenceStart_design61'});
 const setup=new Start();setup.onNodeCreated();
@@ -81,6 +110,16 @@ panel.widgets.find(item=>item.name==='generation_mode').value='Full Video';panel
 if(panelEnd.widgets.some(item=>item.type==='button')) throw Error('Switching to Full left Review buttons visible');
 panel.widgets.find(item=>item.name==='chunk_seconds').value=7;panel.onDrawForeground();
 if(panel._externalProgress.total_seconds!==28) throw Error('Old backend progress overwrote edited planned duration');
+const modeReroute={type:'Reroute',inputs:[{name:'',link:500}],outputs:[{links:[501]}]};
+modeReroute.graph=panel.graph;
+modeReroute.getInputNode=()=>panel;
+panelEnd.getInputNode=()=>modeReroute;
+panel.graph={links:{500:{target_id:8},501:{target_id:7}},getNodeById(id){return id===8?modeReroute:panelEnd;}};
+modeReroute.graph=panel.graph;
+panel.widgets.find(item=>item.name==='generation_mode').value='Review Each Chunk';panel.onDrawForeground();
+if(!panelEnd.widgets.some(item=>item.name==='Use it and continue')) throw Error('Rerouted Review mode buttons missing');
+panel.widgets.find(item=>item.name==='generation_mode').value='Full Video';panel.onDrawForeground();
+if(panelEnd.widgets.some(item=>item.type==='button')) throw Error('Rerouted Full mode left Review/History visible');
 process.stdout.write(JSON.stringify({result:'PASS'}));
 """
     path = tmp_path / "external-review.mjs"

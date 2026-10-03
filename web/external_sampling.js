@@ -12,6 +12,35 @@ const FINISH = "Finish here";
 const RESTART = "Start again from Chunk 1";
 const widget = (node, name) => node.widgets?.find((item) => item.name === name);
 
+export function findExternalSequenceStart(node) {
+    // Saved graphs may place legacy Reroute nodes on the flow wire. Trace that
+    // wire, never choose an unrelated Start by scanning the entire canvas.
+    const visited = new Set();
+    let current = node;
+    while (current && !visited.has(current)) {
+        visited.add(current);
+        if ((current.comfyClass || current.type) === START) return current;
+        const inputs = current.inputs || [];
+        let slot = inputs.findIndex((input) => input.name === "flow" || input.name === "sequence_flow");
+        if (slot < 0) {
+            const linked = inputs.map((input, index) => ({ input, index })).filter(({ input }) => input.link != null);
+            if (linked.length !== 1) return null;
+            slot = linked[0].index;
+        }
+        const input = inputs[slot];
+        const edge = current.graph?.links?.[input?.link];
+        current = current.getInputNode?.(slot) || current.graph?.getNodeById?.(edge?.origin_id);
+    }
+    return null;
+}
+
+function reviewError(node, message) {
+    const status = widget(node, "Review status");
+    if (status) status.value = message;
+    node.setDirtyCanvas?.(true, true);
+    console.error("[design61 External Review]", message);
+}
+
 export function externalReviewActions(state) {
     if (state?.mode === "Full Video") return [];
     if (state?.status === "review_ready") return [CONTINUE, FINISH, RETRY, RESTART];
@@ -103,10 +132,21 @@ function refreshStart(node) {
     if (node._externalPreviewKey !== key) {
         node._externalPreviewKey = key;
         statusPanel(node, { chunks: Number.isFinite(count) ? count : null, completed: 0, current: 1, remaining: Number.isFinite(count) ? count : null, total_seconds: count*seconds, mode: mode?.value }, true);
-        for (const output of node.outputs || []) for (const id of output.links || []) {
-            const edge = node.graph?.links?.[id];
-            const end = node.graph?.getNodeById?.(edge?.target_id);
-            if ((end?.comfyClass || end?.type) === END && end._externalReviewState) updatePanel(end, end._externalReviewState, true);
+        const pending = [node];
+        const visited = new Set();
+        while (pending.length) {
+            const source = pending.pop();
+            if (!source || visited.has(source)) continue;
+            visited.add(source);
+            for (const output of source.outputs || []) for (const id of output.links || []) {
+                const edge = source.graph?.links?.[id];
+                const target = source.graph?.getNodeById?.(edge?.target_id);
+                if ((target?.comfyClass || target?.type) === END) {
+                    if (target._externalReviewState && findExternalSequenceStart(target) === node) updatePanel(target, target._externalReviewState, true);
+                } else if (target?.inputs?.length === 1 && target.inputs[0].link === id) {
+                    pending.push(target); // Single-input reroute/pass-through.
+                }
+            }
         }
     }
 }
@@ -122,8 +162,7 @@ function updatePanel(node, state, presentationOnly = false) {
         widget.options.serialize = false;
         return widget;
     };
-    const start = node.getInputNode?.(0);
-    const linkedStart = start?.comfyClass === START || start?.type === START ? start : null;
+    const linkedStart = findExternalSequenceStart(node);
     const find = (name) => linkedStart?.widgets?.find((widget) => widget.name === name);
     const action = find("review_action");
     const revision = find("expected_revision");
@@ -138,10 +177,23 @@ function updatePanel(node, state, presentationOnly = false) {
     const selectedMode = find("generation_mode")?.value || state.mode;
     for (const label of externalReviewActions({ ...state, mode: selectedMode })) {
         add("button", label, null, async () => {
-            if (!action || !revision) return;
-            action.value = label;
-            revision.value = state.revision;
-            await app.queuePrompt(0, 1);
+            // Resolve again at click time: connections/widgets can be replaced
+            // after the backend Review panel was drawn.
+            const controller = findExternalSequenceStart(node);
+            const command = controller && widget(controller, "review_action");
+            const expected = controller && widget(controller, "expected_revision");
+            if (!command || !expected) {
+                reviewError(node, "Cannot find Sequence Start controls through flow. Check the flow connection.");
+                return;
+            }
+            command.value = label;
+            expected.value = state.revision;
+            node.setDirtyCanvas?.(true, true);
+            try {
+                await app.queuePrompt(0, 1);
+            } catch (error) {
+                reviewError(node, `Could not queue ${label}: ${error?.message || error}`);
+            }
         }, label === FINISH ? "Finalize only accepted chunks now. No remaining chunk is sampled." : label === RESTART ? "Generate again from chunk 1 with a new seed nonce; all old Takes remain stored." : label === RETRY ? "Generate a new Take for this chunk, preserving the accepted prefix and old Take." : "Accept this chunk and execute exactly the next chunk. Its index and media window advance automatically.");
     }
     if (state.history?.length && selectedMode !== "Full Video") {
