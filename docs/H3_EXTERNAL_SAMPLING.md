@@ -24,9 +24,3 @@
 | Start again from Chunk 1 | 从第一段重来，保留已有 Takes |
 
 计划总时长是段数 × 每段秒数；实际输出时长还会受到原生 H3 帧网格和上下文拼接影响。修改连接或设置会影响序列 lineage，已有 Review 操作应以当前后端 revision 为准。
-
-## 验证范围
-
-初版完成了 **30 项 CPU 单元测试**、真实 ComfyUI Core PromptExecutor 的合成 Full / Review / Continue / Retry / Finish / Restart 检查、安装目录六节点加载检查、原版参考图和音频 bundle 互通、原版 Finalize / PackedLayout 检查，以及 FFmpeg 四帧实际编码和清理检查。
-
-这些检查没有加载生成模型或执行 GPU 扩散采样；实际 GPU 质量、浏览器交互及你的模型和外部采样器组合还需要实际工作流验证。暂未发布到 ComfyUI Registry。

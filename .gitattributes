@@ -1,2 +1,2 @@
-# Keep source bytes intact so Git archives and MANIFEST.sha256 agree.
+# Keep runtime source bytes intact across platforms.
 * -text

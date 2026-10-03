@@ -54,12 +54,8 @@ git clone https://github.com/design61/ComfyUI_design61_tools.git
 
 已经安装旧 `ComfyUI_FolderFramesToVideo_design61` 的用户，应禁用旧目录，避免相同节点 ID 重复注册，并保留需要的配置和 FFmpeg 文件。
 
-[观看两个功能的介绍视频](https://github.com/design61/ComfyUI_design61_tools/releases/download/v0.1.1/design61-intro.mp4)。动画作为 Release 附件提供，为功能示意，不是生成效果或 GPU 实测录屏。
-
-## 来源、许可与验证
+## 来源与许可
 
 H3 相关功能基于原版项目二次修改，保留其 MIT 许可证和作者署名。文件夹工具由 design61 提供。本项目为独立工具集，使用 [MIT License](LICENSE)，来源说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-初版完成了 30 项 CPU 测试、合成 Core 执行及原版辅助节点互通、PackedLayout / Finalize、FFmpeg 编码检查。v0.1.1 补充了 Review 按钮经过 Reroute 的回归检查，并在实际 ComfyUI 前端逐按钮点击验证（拦截入队，未执行模型生成）。GPU 生成质量和不同用户环境仍需实际验证，暂未发布到 ComfyUI Registry。
 
 以后新增的自制功能会继续收纳在这个工具集中。
