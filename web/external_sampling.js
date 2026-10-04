@@ -48,6 +48,10 @@ export function externalReviewActions(state) {
     return [];
 }
 
+export function externalReviewReference(state) {
+    return state.contract ? JSON.stringify({ revision: state.revision, contract: state.contract, run_name: state.run_name }) : state.revision;
+}
+
 export function bindExternalConditioningFlow(node) {
     if (node?.comfyClass !== CONDITIONING && node?.type !== CONDITIONING) return false;
     const slot = node.inputs?.findIndex((item) => item.name === "sequence_flow");
@@ -167,7 +171,7 @@ function updatePanel(node, state, presentationOnly = false) {
     const action = find("review_action");
     const revision = find("expected_revision");
     if (action) action.value = "Start / Resume";
-    if (revision) revision.value = state.revision || "";
+    if (revision) revision.value = ""; // Only an explicit button supplies a Review reference.
     if (state.progress && !presentationOnly) {
         statusPanel(node, state.progress);
         if (linkedStart) statusPanel(linkedStart, state.progress);
@@ -187,12 +191,20 @@ function updatePanel(node, state, presentationOnly = false) {
                 return;
             }
             command.value = label;
-            expected.value = state.revision;
+            const reference = externalReviewReference(state);
+            expected.value = reference;
             node.setDirtyCanvas?.(true, true);
             try {
                 await app.queuePrompt(0, 1);
             } catch (error) {
                 reviewError(node, `Could not queue ${label}: ${error?.message || error}`);
+            } finally {
+                // Do not leave a Review command armed for the blue Queue button.
+                // Avoid clearing a newer command submitted by another click.
+                if (command.value === label && expected.value === reference) {
+                    command.value = RESUME;
+                    expected.value = "";
+                }
             }
         }, label === FINISH ? "Finalize only accepted chunks now. No remaining chunk is sampled." : label === RESTART ? "Generate again from chunk 1 with a new seed nonce; all old Takes remain stored." : label === RETRY ? "Generate a new Take for this chunk, preserving the accepted prefix and old Take." : "Accept this chunk and execute exactly the next chunk. Its index and media window advance automatically.");
     }
@@ -252,6 +264,10 @@ app.registerExtension({
                 const previous = nodeType.prototype[hook];
                 nodeType.prototype[hook] = function () {
                     const result = previous?.apply(this, arguments);
+                    if (hook !== "onDrawForeground") {
+                        if (widget(this, "review_action")) widget(this, "review_action").value = RESUME;
+                        if (widget(this, "expected_revision")) widget(this, "expected_revision").value = "";
+                    }
                     refreshStart(this);
                     return result;
                 };
@@ -261,6 +277,7 @@ app.registerExtension({
                 executed?.apply(this, arguments);
                 if (message?.external_progress?.[0]) statusPanel(this, message.external_progress[0]);
                 if (widget(this, "review_action")) widget(this, "review_action").value = RESUME;
+                if (widget(this, "expected_revision")) widget(this, "expected_revision").value = "";
             };
             return;
         }

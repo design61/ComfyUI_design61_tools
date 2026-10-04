@@ -10,16 +10,16 @@ class H3ContinuumExternalSequenceStart_design61:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "sequence_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Fixed, List, Timeline or JSON prompts using existing Continuum parsing and Fixed fallback."}),
+            "sequence_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Fixed, List, Timeline or JSON with Fixed fallback. Review Retry/Continue rereads edited text while keeping the accepted prefix. The blue Queue button starts a new sequence."}),
             "prompt_mode": (PROMPT_FORMAT_OPTIONS, {"default": PROMPT_FORMAT_AUTO, "tooltip": "Existing Continuum prompt interpretation; content never blocks this controller."}),
             "chunks": ("INT", {"default": 4, "min": 1, "max": 16, "tooltip": "Number of physical segments. Each segment executes the external high-noise/upscale/low-noise graph before the next starts."}),
             "chunk_seconds": ("FLOAT", {"default": 5.0, "min": 4.0, "max": 15.0, "step": 0.1, "tooltip": "Duration per segment before native H3 temporal-grid alignment; uses the existing Continuum prompt-plan range."}),
             "continuity": (CONTINUITY_OPTIONS, {"default": CONTINUITY_OPTIONS[0], "tooltip": "Use this same continuity setting in both External Prepare nodes."}),
             "base_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "tooltip": "Existing deterministic chunk-seed derivation. Connect output seed to external RandomNoise and any restart seed."}),
             "generation_mode": ([FULL, REVIEW], {"default": REVIEW, "display_name": "Generation Mode", "tooltip": "Full Video runs every chunk without Review buttons. Review Each Chunk pauses after every chunk for Continue, Finish here, Retry or Restart all."}),
-            "review_action": ([*ACTIONS, LEGACY_FINISH], {"default": ACTIONS[0], "tooltip": "Internal command set by Sequence End buttons. Hidden in Start; Finish here finalizes only completed chunks, and Restart all preserves old Takes."}),
+            "review_action": ([*ACTIONS, LEGACY_FINISH], {"default": ACTIONS[0], "tooltip": "Internal one-shot command set by Sequence End buttons. Review actions retain the selected run after prompt edits. Normal Queue starts fresh. Finish here finalizes completed chunks; Restart all preserves old Takes."}),
             "run_name": ("STRING", {"default": "external_dual_sampling", "tooltip": "Separate external-review run name. The submitted graph defines its lineage; old Takes are retained when settings change."}),
-            "expected_revision": ("STRING", {"default": "", "tooltip": "Backend revision returned by Sequence End. Review buttons use this to avoid applying stale browser actions."}),
+            "expected_revision": ("STRING", {"default": "", "tooltip": "Internal backend lineage/revision reference submitted only by Review buttons; old plain revision references still load. Normal Queue leaves this empty."}),
         }, "optional": {"iteration": ("H3_CONTINUUM_EXTERNAL_FLOW", {"tooltip": "Internal dynamic-expansion continuation payload; leave unconnected in the visible workflow."})},
             "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"}}
     RETURN_TYPES = ("H3_CONTINUUM_EXTERNAL_FLOW", "H3_CONTINUUM_STATE", "H3_CONTINUUM_EXTERNAL_SEQUENCE", "STRING", "INT", "INT")

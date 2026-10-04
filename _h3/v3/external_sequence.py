@@ -67,6 +67,48 @@ def graph_contract(prompt, start_id):
     return hashlib.sha256((str(start_id) + raw).encode("utf-8")).hexdigest()
 
 
+def review_reference(value):
+    """Read a button's lineage reference; old plain revision strings still load."""
+    try:
+        reference = json.loads(value)
+    except (TypeError, ValueError):
+        return str(value or ""), None, None
+    if not isinstance(reference, dict):
+        return str(value or ""), None, None
+    contract = reference.get("contract")
+    if not isinstance(contract, str) or len(contract) != 64 or any(c not in "0123456789abcdef" for c in contract):
+        contract = None
+    return str(reference.get("revision") or ""), contract, reference.get("run_name")
+
+
+def review_store(run_name, execution_contract, expected_revision):
+    revision, anchor, anchor_name = review_reference(expected_revision)
+    if anchor:
+        name = str(anchor_name) if anchor_name is not None else run_name
+        return ExternalReviewStore(name, anchor), name, revision
+    store = ExternalReviewStore(run_name, execution_contract)
+    if revision and canonical_revision(store.index()) != revision:
+        # A panel drawn by the previous frontend carries only a revision. Find
+        # that existing lineage by its saved revision, without loading tensors
+        # or changing any index. UUID revisions uniquely identify their store.
+        prefix = hashlib.sha256(str(run_name).encode("utf-8")).hexdigest()[:16]
+        matches = []
+        for path in (session_directory() / "external_sampling").glob(prefix + "_*/index.json"):
+            try:
+                index = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(index, dict) or index.get("magic") != "H3_EXTERNAL_REVIEW":
+                continue
+            if revision == index.get("revision", index.get("head")) or revision in index.get("records", {}):
+                contract = index.get("contract", "")
+                if isinstance(contract, str) and len(contract) == 64 and all(c in "0123456789abcdef" for c in contract):
+                    matches.append(ExternalReviewStore(run_name, contract))
+        if len(matches) == 1:
+            store = matches[0]
+    return store, run_name, revision
+
+
 class ExternalReviewStore:
     def __init__(self, run_name, contract):
         self.contract = contract
@@ -119,10 +161,12 @@ class ExternalReviewStore:
                 chunks=[entry], width=plan["width"], height=plan["height"],
                 chunk_seconds=plan["requested_extend_seconds"], identity_hash=self.contract,
                 model_fingerprint_value=self.contract, parent_session_id=None,
-                reroll_from_chunk=0, settings={"external_contract": self.contract, "external_revision": revision, "external_parent": flow["parent_head"]},
+                reroll_from_chunk=0, settings={"external_contract": self.contract, "external_revision": revision, "external_parent": flow["parent_head"],
+                                             "external_execution_contract": flow.get("execution_contract", self.contract)},
             )
             save_session(session, prefix=prefix, slot=1)
-            index["records"][revision] = {"prefix": prefix, "parent": flow["parent_head"], "chunk": entry["clip_index"], "seed": entry["seed"], "nonce": flow["nonce"]}
+            index["records"][revision] = {"prefix": prefix, "parent": flow["parent_head"], "chunk": entry["clip_index"], "seed": entry["seed"], "nonce": flow["nonce"],
+                                           "execution_contract": flow.get("execution_contract", self.contract)}
             complete = entry["clip_index"] >= flow["target_chunks"]
             status = "complete" if complete else "review_ready" if flow["mode"] == REVIEW else "in_progress"
             index.update(head=revision, revision=revision, mode=flow["mode"], status=status,
@@ -160,8 +204,14 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
         review_action = ACTIONS[3] if review_action == LEGACY_FINISH else review_action
         if generation_mode == FULL:
             review_action = ACTIONS[0]
-        contract = graph_contract(prompt or {}, unique_id)
-        store = ExternalReviewStore(run_name, contract)
+        execution_contract = graph_contract(prompt or {}, unique_id)
+        # Review commands belong to the panel's accepted lineage, even when
+        # upstream text changes. Normal Queue has no reference and starts fresh.
+        if review_action == ACTIONS[0] and not expected_revision:
+            store, revision = ExternalReviewStore(run_name, execution_contract), ""
+        else:
+            store, run_name, revision = review_store(run_name, execution_contract, expected_revision)
+        contract = store.contract
         index = store.index()
         entries = store.entries(index)
         head = index["head"]
@@ -169,8 +219,11 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
         parent_head = head
         active = len(entries) < int(chunks) and index["status"] not in ("review_ready", "complete")
         target_chunks = int(index.get("finalized_chunks") or chunks)
-        if head and expected_revision and expected_revision != canonical_revision(index):
+        if revision and revision != canonical_revision(index):
             active = False  # Stale browser action is diagnostic, never a destructive rewrite.
+        elif review_action == ACTIONS[0] and not revision:
+            entries, parent_head, target_chunks, nonce = [], "", int(chunks), 0
+            active = True  # Blue Queue: a new sequence; old Takes stay immutable.
         elif review_action == ACTIONS[3]:
             index = store.finish_here(canonical_revision(index))
             target_chunks = int(index.get("finalized_chunks") or chunks)
@@ -191,7 +244,7 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
         plans = make_prompt_plan(mode=prompt_mode, script=sequence_prompt, chunks=int(chunks), chunk_seconds=float(chunk_seconds))
         if plans["mode"] == PROMPT_MODE_FIXED:
             plans["prompts"] = [str(sequence_prompt)] * int(chunks)
-        flow = {"contract": contract, "run_name": run_name, "chunks": int(chunks), "seconds": float(chunk_seconds),
+        flow = {"contract": contract, "execution_contract": execution_contract, "run_name": run_name, "chunks": int(chunks), "seconds": float(chunk_seconds),
                 "continuity": continuity, "base_seed": int(base_seed), "prompts": plans["prompts"],
                 "mode": generation_mode, "target_chunks": target_chunks, "entries": tuple(entries),
                 "expected_head": head, "expected_revision": canonical_revision(index), "parent_head": parent_head, "nonce": nonce, "active": active,
@@ -221,7 +274,7 @@ def sequence_outputs(entries, chunk_seconds=None):
 def review_payload(flow, index):
     head = index["head"]
     records = index["records"]
-    return {"status": index["status"], "revision": canonical_revision(index), "chunks": flow["chunks"], "mode": flow["mode"],
+    return {"status": index["status"], "revision": canonical_revision(index), "contract": flow["contract"], "run_name": flow["run_name"], "chunks": flow["chunks"], "mode": flow["mode"],
             "accepted": records[head]["chunk"] if head else 0,
             "review_unit": index.get("review_unit"),
             "progress": sequence_progress(flow, index),
@@ -280,7 +333,13 @@ def end_sequence(*, flow, samples=None, plan=None, dynprompt=None, unique_id=Non
         previous_sequence={"magic": SEQUENCE_MAGIC, "version": 1, "entries": flow["entries"]} if flow["entries"] else None,
     )
     entries = captured[5]["entries"]
-    index = store.commit(flow, entries[-1])
+    # Record the actual prompt for the newly sampled Take only. Accepted prefix
+    # entries and older Take Session files remain byte-for-byte untouched.
+    entry = dict(entries[-1])
+    entry["prompt"] = flow["prompts"][len(flow["entries"])]
+    entry["prompt_hash"] = hashlib.sha256(entry["prompt"].encode("utf-8")).hexdigest()
+    entries = (*entries[:-1], entry)
+    index = store.commit(flow, entry)
     ui = {"external_review": [review_payload(flow, index)]}
     if index["status"] == "in_progress":
         next_flow = dict(flow, entries=entries, expected_head=index["head"], expected_revision=canonical_revision(index), parent_head=index["head"], index=index, status=index["status"])
