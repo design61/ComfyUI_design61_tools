@@ -10,6 +10,8 @@ const CONTINUE = "Use it and continue";
 const RETRY = "Try this chunk again";
 const FINISH = "Finish here";
 const RESTART = "Start again from Chunk 1";
+const CONTINUE_ALL = "Continue all remaining chunks";
+const REGENERATE_FROM = "Regenerate from selected chunk";
 const widget = (node, name) => node.widgets?.find((item) => item.name === name);
 
 export function findExternalSequenceStart(node) {
@@ -43,13 +45,13 @@ function reviewError(node, message) {
 
 export function externalReviewActions(state) {
     if (state?.mode === "Full Video") return [];
-    if (state?.status === "review_ready") return [CONTINUE, FINISH, RETRY, RESTART];
+    if (state?.status === "review_ready") return [CONTINUE, CONTINUE_ALL, FINISH, RETRY, RESTART];
     if (state?.status === "complete" && state.review_unit) return [RETRY, RESTART];
     return [];
 }
 
-export function externalReviewReference(state) {
-    return state.contract ? JSON.stringify({ revision: state.revision, contract: state.contract, run_name: state.run_name }) : state.revision;
+export function externalReviewReference(state, restartChunk) {
+    return state.contract || restartChunk != null ? JSON.stringify({ revision: state.revision, contract: state.contract, run_name: state.run_name, restart_chunk: restartChunk }) : state.revision;
 }
 
 export function bindExternalConditioningFlow(node) {
@@ -159,8 +161,8 @@ function updatePanel(node, state, presentationOnly = false) {
     if (!state || !["review_ready", "complete", "in_progress"].includes(state.status)) return;
     node._externalReviewState = state;
     node.widgets = (node.widgets || []).filter((widget) => !widget._externalReview);
-    const add = (type, name, value, callback, tooltip) => {
-        const widget = node.addWidget(type, name, value, callback, { serialize: false, tooltip });
+    const add = (type, name, value, callback, tooltip, extra = {}) => {
+        const widget = node.addWidget(type, name, value, callback, { ...extra, serialize: false, tooltip });
         widget._externalReview = true;
         widget.serialize = false;
         widget.options.serialize = false;
@@ -178,9 +180,8 @@ function updatePanel(node, state, presentationOnly = false) {
     }
     const label = state.status === "complete" ? "Saved sequence is complete" : state.status === "review_ready" ? `Chunk ${state.accepted} is ready for review` : `Generating ${state.accepted}/${state.chunks} chunks`;
     add("text", "Review status", label, () => {}, "Canonical saved backend status. Review controls are never inferred from visible widget values.");
-    const selectedMode = find("generation_mode")?.value || state.mode;
-    for (const label of externalReviewActions({ ...state, mode: selectedMode })) {
-        add("button", label, null, async () => {
+    const selectedMode = presentationOnly ? find("generation_mode")?.value || state.mode : state.mode || find("generation_mode")?.value;
+    const queueAction = async (label, restartChunk) => {
             // Resolve again at click time: connections/widgets can be replaced
             // after the backend Review panel was drawn.
             const controller = findExternalSequenceStart(node);
@@ -191,7 +192,7 @@ function updatePanel(node, state, presentationOnly = false) {
                 return;
             }
             command.value = label;
-            const reference = externalReviewReference(state);
+            const reference = externalReviewReference(state, restartChunk);
             expected.value = reference;
             node.setDirtyCanvas?.(true, true);
             try {
@@ -206,7 +207,21 @@ function updatePanel(node, state, presentationOnly = false) {
                     expected.value = "";
                 }
             }
-        }, label === FINISH ? "Finalize only accepted chunks now. No remaining chunk is sampled." : label === RESTART ? "Generate again from chunk 1 with a new seed nonce; all old Takes remain stored." : label === RETRY ? "Generate a new Take for this chunk, preserving the accepted prefix and old Take." : "Accept this chunk and execute exactly the next chunk. Its index and media window advance automatically.");
+    };
+    for (const label of externalReviewActions({ ...state, mode: selectedMode })) {
+        add("button", label, null, () => queueAction(label), label === CONTINUE_ALL ? "Keep all accepted chunks and automatically generate every remaining chunk without Review pauses. Uses updated upstream prompts. Normal blue Queue still starts fresh." : label === FINISH ? "Finalize only accepted chunks now. No remaining chunk is sampled." : label === RESTART ? "Generate again from chunk 1 with a new seed nonce; all old Takes remain stored." : label === RETRY ? "Generate a new Take for this chunk, preserving the accepted prefix and old Take." : "Accept this chunk and execute exactly the next chunk. Its index and media window advance automatically.");
+    }
+    const chunks = state.accepted_chunks || [];
+    if (selectedMode !== "Full Video" && ["review_ready", "complete"].includes(state.status) && chunks.length) {
+        const selected = chunks.includes(node._externalRestartChunk) ? node._externalRestartChunk : chunks.at(-1);
+        node._externalRestartChunk = selected;
+        const choice = add("combo", "Restart from chunk", `Chunk ${selected}`, value => {
+            node._externalRestartChunk = Number(String(value).replace("Chunk ", ""));
+        }, "Choose an already accepted chunk. Regeneration keeps only its earlier prefix in the active sequence; old later Takes remain in History.", { values: chunks.map(number => `Chunk ${number}`) });
+        add("button", REGENERATE_FROM, null, () => {
+            const target = Number(String(choice.value).replace("Chunk ", ""));
+            return queueAction(REGENERATE_FROM, target);
+        }, "Regenerate the selected chunk using current prompts, then pause for Review. Later old chunks leave the active sequence when this Take succeeds; continue to regenerate following chunks. History stays intact.");
     }
     if (state.history?.length && selectedMode !== "Full Video") {
         add("button", `Render History — ${state.history.length} Takes`, null, () => {

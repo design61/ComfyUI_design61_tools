@@ -25,6 +25,8 @@
 
 Review 期间可以修改上游提示词，再用 End 的按钮执行：重试当前段会保留之前已接受的片段，继续则读取修改后的下一段提示词。点击 ComfyUI 蓝色运行按钮会从第一段开始新一轮，旧 Takes 仍保留。
 
+End 的 `Continue all remaining chunks` 可在逐段 Review 中接受当前段，并自动生成全部剩余段，无需改 Start 的模式。`Restart from chunk` 下拉框列出当前序列已接受的段；选择第 3 段后点击 `Regenerate from selected chunk`，会保留前两段并重做第三段，成功后旧的第 4、5 等后续段退出当前序列，需要重新生成，历史 Takes 保留。
+
 | 拆分节点 | 功能 |
 | --- | --- |
 | H3 Continuum External Sequence Start_design61 | 设置段数和每段时长，控制序列开始，显示时长与进度 |

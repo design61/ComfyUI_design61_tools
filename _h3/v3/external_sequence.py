@@ -26,7 +26,8 @@ START = "H3ContinuumExternalSequenceStart_design61"
 END = "H3ContinuumExternalSequenceEnd_design61"
 REVIEW = "Review Each Chunk"
 FULL = "Full Video"
-ACTIONS = ("Start / Resume", "Use it and continue", "Try this chunk again", "Finish here", "Start again from Chunk 1")
+ACTIONS = ("Start / Resume", "Use it and continue", "Try this chunk again", "Finish here", "Start again from Chunk 1",
+           "Continue all remaining chunks", "Regenerate from selected chunk")
 LEGACY_FINISH = "Use it and finish the rest"
 
 
@@ -107,6 +108,17 @@ def review_store(run_name, execution_contract, expected_revision):
         if len(matches) == 1:
             store = matches[0]
     return store, run_name, revision
+
+
+def selected_review_chunk(reference, accepted):
+    """Read the explicit End selection; malformed/stale choices are read-only."""
+    try:
+        value = json.loads(reference).get("restart_chunk")
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if type(value) is int and 1 <= value <= accepted:
+        return value
+    return None
 
 
 class ExternalReviewStore:
@@ -202,7 +214,7 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
     else:
         generation_mode = REVIEW if generation_mode in (REVIEW, "Review by Chunk") else FULL
         review_action = ACTIONS[3] if review_action == LEGACY_FINISH else review_action
-        if generation_mode == FULL:
+        if generation_mode == FULL and review_action not in ACTIONS[5:]:
             review_action = ACTIONS[0]
         execution_contract = graph_contract(prompt or {}, unique_id)
         # Review commands belong to the panel's accepted lineage, even when
@@ -232,6 +244,21 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
             entries, parent_head, target_chunks = [], "", int(chunks)
             nonce += 1
             active = True
+        elif review_action == ACTIONS[5]:
+            generation_mode = FULL
+            active = len(entries) < target_chunks and index["status"] != "complete"
+        elif review_action == ACTIONS[6]:
+            selected = selected_review_chunk(expected_revision, len(entries))
+            active = selected is not None
+            if active:
+                # Branch from the selected segment's predecessor. Old later
+                # Takes leave the active chain only when the new Take commits.
+                cursor = head
+                while cursor and index["records"][cursor]["chunk"] >= selected:
+                    cursor = index["records"][cursor]["parent"]
+                entries, parent_head = entries[:selected - 1], cursor
+                target_chunks, generation_mode = int(chunks), REVIEW
+                nonce += 1
         elif head and review_action == ACTIONS[2] and index.get("review_unit"):
             entries = entries[:-1]
             parent_head = index["records"][head]["parent"]
@@ -276,6 +303,7 @@ def review_payload(flow, index):
     records = index["records"]
     return {"status": index["status"], "revision": canonical_revision(index), "contract": flow["contract"], "run_name": flow["run_name"], "chunks": flow["chunks"], "mode": flow["mode"],
             "accepted": records[head]["chunk"] if head else 0,
+            "accepted_chunks": list(range(1, records[head]["chunk"] + 1)) if head else [],
             "review_unit": index.get("review_unit"),
             "progress": sequence_progress(flow, index),
             "history": [{"revision": key, "chunk": record["chunk"], "seed": record["seed"]} for key, record in records.items()]}

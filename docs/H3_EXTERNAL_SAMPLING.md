@@ -19,12 +19,16 @@
 | 操作 | 行为 |
 | --- | --- |
 | Use it and continue | 接受当前段，自动运行下一段 |
+| Continue all remaining chunks | 保留已接受的全部片段，自动生成剩余所有段，不再逐段暂停；无需修改 Start 模式 |
 | Finish here | 以截至当前段的已接受片段结束，不再生成后面的段 |
 | Retry this chunk | 重做当前段，保留历史 Take |
 | Start again from Chunk 1 | 从第一段重来，保留已有 Takes |
+| Restart from chunk + Regenerate from selected chunk | 下拉选择当前已接受的段，从该段重新生成并暂停 Review；更早的段保留，旧的该段及后续段退出当前序列，历史 Takes 保留 |
 
 Review 时修改上游提示词后，使用 End 的按钮继续操作，按钮会指向当前已接受的序列，并重新解析修改后的分块文本。例如在第三段 Review 时，重试保留第一、二段并用新提示词生成第三段；继续保留前三段并读取新的第四段提示词。已接受的片段和历史 Takes 不会因提示词修改而被覆盖。
 
 点击 ComfyUI 蓝色运行按钮会从第一段开始新一轮；End 的「Start again from Chunk 1」也会明确重来，并使用新的 seed nonce。按钮指令只用于本次提交，不会留给后续蓝色运行。此机制不自动调整已有 State 的分辨率或布局。
+
+例如计划十段、已完成五段：点击 `Continue all remaining chunks` 会从第六段自动跑到第十段；下拉选第三段并执行重做，会以第二段的已接受 State 为上下文，使用当前提示词生成新第三段。成功后当前序列只包含第 1、2、新 3 段，再点继续会重新生成第四段。新第三段失败时，原有五段的已接受链仍保留；成功提交后才切换到新链。下拉框随后只列出当前链中的第 1～3 段。
 
 计划总时长是段数 × 每段秒数；实际输出时长还会受到原生 H3 帧网格和上下文拼接影响。已有 Review 操作以当前后端 revision 为准，过期按钮不会覆盖新提交的 Take。
