@@ -14,7 +14,7 @@
 6. 驱动音频接入两个 Conditioning，并同时接到 End 的 `driving_audio`，供原版 Finalize 拼接时使用；提前结束时按已完成时长裁切。
 7. 默认 `Latents (existing)` 模式中，End 输出的视频 / 音频 latent 列表及 assembly plan，交给原版 Finalize / 对应外部解码保存节点。分段落盘模式使用下面的 FFmpeg 接线。
 
-`Full Video` 自动跑完整个序列，End 不出现逐段操作按钮。`Review Each Chunk` 每完成一段暂停，End 提供以下操作：
+`Full Video` 自动跑完整个序列，运行中 End 只提供 `Stop`，不显示逐段操作按钮；全部段完成后隐藏 Stop。`Review Each Chunk` 每完成一段暂停，End 提供以下操作：
 
 | 操作 | 行为 |
 | --- | --- |
@@ -24,6 +24,10 @@
 | Retry this chunk | 重做当前段 |
 | Start again from Chunk 1 | 从第一段重来 |
 | Restart from chunk + Regenerate from selected chunk | 下拉选择当前已接受的段，从该段重新生成并暂停 Review；更早的段保留，成功后旧的该段及后续段退出当前序列 |
+
+Full Video 的 `Stop` 只针对它所属的正在运行的 ComfyUI prompt，不会取消后面的排队任务。停止请求提交后显示 `Stopping…`，当前运行确实退出后才恢复 Review 按钮，并自动把 Start 切到 `Review Each Chunk`。停止时保留原目录、已接受的段、续写 State 和历史记录，不会删除已保存的片段；未完成的段不加入已接受序列，存帧模式会清理该段未提交的暂存素材。
+
+例如第三段尚在采样或保存时停止：保留第一、二段，状态显示当前第三段、已完成两段。修改上游提示词再点 `Try this chunk again` 会重新读取提示词并生成第三段，`Use it and continue` 也从第三段执行；下拉框只能选择已经保存的第一、二段。若第三段已经提交后停止，则保存第一～三段，重跑当前段会重做第三段。可点 `Finish here` 合成已接受的前两段，也可点 `Continue all remaining chunks` 继续自动生成剩余段，新一轮自动运行仍可 Stop。第一段还没完成就停止时，没有可提前结束或选择的已接受段，可以重跑第一段或继续。
 
 Review 时修改上游提示词后，使用 End 的按钮继续操作，按钮会指向当前已接受的序列，并重新解析修改后的分块文本。例如在第三段 Review 时，重试保留第一、二段并用新提示词生成第三段；继续保留前三段并读取新的第四段提示词。单独修改文本不会删除已接受的片段。
 

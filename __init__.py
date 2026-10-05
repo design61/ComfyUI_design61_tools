@@ -3,6 +3,7 @@ from ._h3.v3.external_sampling_nodes import H3ContinuumExternalConditioning_desi
 from ._h3.v3.external_sequence_nodes import H3ContinuumExternalSequenceStart_design61, H3ContinuumExternalSequenceEnd_design61
 from .folder_frames_to_video import NODE_CLASS_MAPPINGS as folder
 from .ninfer_sharing import NInferAgentSharingSettings_design61, install_hooks
+from ._h3.v3.external_control import install_control_routes
 WEB_DIRECTORY = "./web"
 NODE_CLASS_MAPPINGS = {
     "H3ContinuumExternalSequenceStart_design61": H3ContinuumExternalSequenceStart_design61,
@@ -17,4 +18,5 @@ for node_id, node in NODE_CLASS_MAPPINGS.items():
     node.CATEGORY = "design61/FFmpeg" if node_id in folder else "design61/NInfer" if node_id == "NInferAgentSharingSettings_design61" else "design61/H3 Continuum"
 NODE_DISPLAY_NAME_MAPPINGS["NInferAgentSharingSettings_design61"] = "NInfer 显存交接设置_design61"
 install_hooks()
+install_control_routes()
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

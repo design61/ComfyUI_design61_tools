@@ -21,6 +21,7 @@ from ..v2.session import entry_to_state, make_session
 from ..v2.session_io import load_session, save_session, session_directory
 from .external_sampling import SEQUENCE_MAGIC, capture_external_segment
 from .plan import prepare_physical_decode_entries
+from .external_control import guard_stop, track_start, track_commit
 
 START = "H3ContinuumExternalSequenceStart_design61"
 END = "H3ContinuumExternalSequenceEnd_design61"
@@ -43,9 +44,15 @@ def sequence_progress(flow, index=None):
         completed = index["records"][index["head"]]["chunk"] if index["head"] else 0
         active = False
         status = index["status"]
-    return {"mode": flow["mode"], "status": status, "chunks": flow["chunks"],
+    current = completed + 1 if active else completed if status == "review_ready" else None
+    if index is not None and status == "review_ready" and (index.get("review_unit") or {}).get("pending"):
+        current = index["review_unit"]["chunk"]
+    return {"mode": index.get("mode", flow["mode"]) if index is not None else flow["mode"], "status": status, "chunks": flow["chunks"],
+            "control_token": flow.get("_control"),
+            "stopped": bool(index and index.get("stopped")),
+            "pending": bool(index and (index.get("review_unit") or {}).get("pending")),
             "storage_mode": flow.get("storage_mode", "Latents (existing)"),
-            "completed": completed, "current": completed + 1 if active else completed if status == "review_ready" else None,
+            "completed": completed, "current": current,
             "remaining": max(0, flow["chunks"]-completed) if status != "complete" else 0,
             "skipped": max(0, flow["chunks"]-completed) if status == "complete" else 0,
             "seconds": flow["seconds"], "total_seconds": flow["chunks"]*flow["seconds"],
@@ -168,10 +175,12 @@ class ExternalReviewStore:
         return entries
 
     def commit(self, flow, entry):
+        guard_stop(flow)
         self.root.mkdir(parents=True, exist_ok=True)
         lock = _RunLock(self.root / ".lock")
         lock.acquire()
         try:
+            guard_stop(flow)
             index = self.index()
             if index["head"] != flow["expected_head"] or canonical_revision(index) != flow["expected_revision"]:
                 raise RunStorageError("external review head changed during Sampling; refusing to overwrite another accepted Take")
@@ -186,13 +195,43 @@ class ExternalReviewStore:
                                              "external_execution_contract": flow.get("execution_contract", self.contract)},
             )
             save_session(session, prefix=prefix, slot=1)
+            guard_stop(flow)
             index["records"][revision] = {"prefix": prefix, "parent": flow["parent_head"], "chunk": entry["clip_index"], "seed": entry["seed"], "nonce": flow["nonce"],
                                            "execution_contract": flow.get("execution_contract", self.contract)}
+            if flow.get("_control"):
+                index["records"][revision]["execution_token"] = flow["_control"]
+            index.pop("stopped", None)
             complete = entry["clip_index"] >= flow["target_chunks"]
             status = "complete" if complete else "review_ready" if flow["mode"] == REVIEW else "in_progress"
             index.update(head=revision, revision=revision, mode=flow["mode"], status=status,
                          review_unit={"chunk": entry["clip_index"]} if flow["mode"] == REVIEW else None,
                          finalized_chunks=flow["target_chunks"] if complete else None)
+            _write_json(self.path, index)
+            return index
+        finally:
+            lock.release()
+
+    def pause_for_review(self, flow, token):
+        """Checkpoint only this run's accepted prefix; never delete stored media."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock = _RunLock(self.root / ".lock")
+        lock.acquire()
+        try:
+            index = self.index()
+            head = index["head"]
+            if index["records"].get(head, {}).get("execution_token") != token:
+                if head != flow["expected_head"] or canonical_revision(index) != flow["expected_revision"]:
+                    raise RunStorageError("Stop checkpoint found a different accepted revision; stored Takes were preserved")
+                head = flow["parent_head"]
+            accepted = index["records"][head]["chunk"] if head else 0
+            pending = accepted < flow["chunk_index"]
+            complete = accepted >= flow["target_chunks"]
+            unit = {"chunk": accepted + 1, "pending": True} if pending and not complete else {"chunk": accepted} if accepted else None
+            index.update(head=head, revision=uuid.uuid4().hex, mode=REVIEW,
+                         status="complete" if complete else "review_ready", review_unit=unit,
+                         stopped=True, seconds=flow["seconds"], finalized_chunks=flow["target_chunks"] if complete else None)
+            if "view" in index:
+                index["view"] = None  # Rebuild only the accepted prefix on a later output query.
             _write_json(self.path, index)
             return index
         finally:
@@ -208,7 +247,9 @@ class ExternalReviewStore:
             if canonical_revision(index) != expected:
                 return index
             if index["head"]:
-                index.update(status="complete", finalized_chunks=index["records"][index["head"]]["chunk"], revision=uuid.uuid4().hex)
+                count = index["records"][index["head"]]["chunk"]
+                index.update(status="complete", finalized_chunks=count, review_unit={"chunk": count}, revision=uuid.uuid4().hex)
+                index.pop("stopped", None)
                 _write_json(self.path, index)
             return index
         finally:
@@ -272,9 +313,10 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
                 entries, parent_head = entries[:selected - 1], cursor
                 target_chunks, generation_mode = int(chunks), REVIEW
                 nonce += 1
-        elif head and review_action == ACTIONS[2] and index.get("review_unit"):
-            entries = entries[:-1]
-            parent_head = index["records"][head]["parent"]
+        elif review_action == ACTIONS[2] and index.get("review_unit"):
+            if not index["review_unit"].get("pending"):
+                entries = entries[:-1]
+                parent_head = index["records"][head]["parent"]
             nonce += 1
             active = True
         elif generation_mode == FULL:
@@ -289,6 +331,9 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
                 "mode": generation_mode, "target_chunks": target_chunks, "entries": tuple(entries),
                 "expected_head": head, "expected_revision": canonical_revision(index), "parent_head": parent_head, "nonce": nonce, "active": active,
                 "status": index["status"], "index": index, "storage_mode": storage_mode, "frame_root": frame_root}
+    guard_stop(flow)
+    flow["chunk_index"] = len(flow["entries"]) + 1
+    track_start(flow, prompt, unique_id)
     entries = flow["entries"]
     position = len(entries)
     if flow.get("storage_mode") == "Frames + tail State (disk)":
@@ -319,11 +364,12 @@ def sequence_outputs(entries, chunk_seconds=None):
 def review_payload(flow, index):
     head = index["head"]
     records = index["records"]
-    return {"status": index["status"], "revision": canonical_revision(index), "contract": flow["contract"], "run_name": flow["run_name"], "chunks": flow["chunks"], "mode": flow["mode"],
+    return {"status": index["status"], "revision": canonical_revision(index), "contract": flow["contract"], "run_name": flow["run_name"], "chunks": flow["chunks"], "mode": index.get("mode", flow["mode"]),
             "storage_mode": flow.get("storage_mode", "Latents (existing)"), "frame_root": flow.get("frame_root", ""),
             "accepted": records[head]["chunk"] if head else 0,
             "accepted_chunks": list(range(1, records[head]["chunk"] + 1)) if head else [],
             "review_unit": index.get("review_unit"),
+            "stopped": bool(index.get("stopped")), "control_token": flow.get("_control"),
             "progress": sequence_progress(flow, index),
             "history": [{"revision": key, "chunk": record["chunk"], "seed": record["seed"], **({"discarded": True} if record.get("discarded") else {})} for key, record in records.items()]}
 
@@ -380,6 +426,7 @@ def expand_next_iteration(dynprompt, end_id, next_flow):
 
 
 def end_sequence(*, flow, samples=None, plan=None, dynprompt=None, unique_id=None, driving_audio=None):
+    guard_stop(flow)
     store = ExternalReviewStore(flow["run_name"], flow["contract"])
     def outputs(entries):
         result = sequence_outputs(entries, flow["seconds"])
@@ -406,6 +453,8 @@ def end_sequence(*, flow, samples=None, plan=None, dynprompt=None, unique_id=Non
     entry["prompt_hash"] = hashlib.sha256(entry["prompt"].encode("utf-8")).hexdigest()
     entries = (*entries[:-1], entry)
     index = store.commit(flow, entry)
+    track_commit(flow, index)
+    guard_stop(flow)
     ui = {"external_review": [review_payload(flow, index)]}
     if index["status"] == "in_progress":
         next_flow = dict(flow, entries=entries, expected_head=index["head"], expected_revision=canonical_revision(index), parent_head=index["head"], index=index, status=index["status"])

@@ -2,6 +2,7 @@
 from ..constants import CONTINUITY_OPTIONS, PROMPT_FORMAT_AUTO, PROMPT_FORMAT_OPTIONS
 from .external_sequence import ACTIONS, LEGACY_FINISH, FULL, REVIEW, begin_sequence, end_sequence, sequence_progress, expanded_output_packet
 from .frame_storage import LATENTS, FRAMES, end_frame_sequence
+from .external_control import guard_stop
 
 CATEGORY = "MiniMax H3/Continuum/External Sampling"
 
@@ -17,7 +18,7 @@ class H3ContinuumExternalSequenceStart_design61:
             "chunk_seconds": ("FLOAT", {"default": 5.0, "min": 4.0, "max": 15.0, "step": 0.1, "tooltip": "Duration per segment before native H3 temporal-grid alignment; uses the existing Continuum prompt-plan range."}),
             "continuity": (CONTINUITY_OPTIONS, {"default": CONTINUITY_OPTIONS[0], "tooltip": "Use this same continuity setting in both External Prepare nodes."}),
             "base_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "tooltip": "Existing deterministic chunk-seed derivation. Connect output seed to external RandomNoise and any restart seed."}),
-            "generation_mode": ([FULL, REVIEW], {"default": REVIEW, "display_name": "Generation Mode", "tooltip": "Full Video runs every chunk without Review buttons. Review Each Chunk pauses after every chunk for Continue, Finish here, Retry or Restart all."}),
+            "generation_mode": ([FULL, REVIEW], {"default": REVIEW, "display_name": "Generation Mode", "tooltip": "Full Video runs every chunk automatically; End offers Stop to preserve completed chunks and switch to Review. Review Each Chunk pauses after every chunk for Continue, Finish here, Retry or Restart all."}),
             "review_action": ([*ACTIONS, LEGACY_FINISH], {"default": ACTIONS[0], "tooltip": "Internal one-shot command set by Sequence End. Continue all runs the remaining chunks automatically. Regenerate from selected chunk keeps its earlier prefix and branches with new Takes. Prompt edits are reread; normal Queue starts fresh."}),
             "run_name": ("STRING", {"default": "external_dual_sampling", "tooltip": "Separate external-review run name. Review buttons preserve this lineage across prompt edits. Latents retains old Takes; Frames removes superseded media only after replacement succeeds."}),
             "expected_revision": ("STRING", {"default": "", "tooltip": "Internal backend lineage/revision reference submitted only by Review buttons; old plain revision references still load. Normal Queue leaves this empty."}),
@@ -63,6 +64,7 @@ class H3ContinuumExternalSequenceEnd_design61:
     CATEGORY = CATEGORY
     OUTPUT_NODE = True
     def check_lazy_status(self, flow, samples=None, plan=None, **kwargs):
+        guard_stop(flow)
         if not flow["active"]:
             return []
         required = [("samples", samples), ("plan", plan)]

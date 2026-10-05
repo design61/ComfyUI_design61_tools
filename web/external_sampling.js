@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { refreshV39ReferenceImagesForSampler } from "./upstream_reference_images.js";
 
 const END = "H3ContinuumExternalSequenceEnd_design61";
@@ -46,7 +47,7 @@ function reviewError(node, message) {
 
 export function externalReviewActions(state) {
     if (state?.mode === "Full Video") return [];
-    if (state?.status === "review_ready") return [CONTINUE, CONTINUE_ALL, FINISH, RETRY, RESTART];
+    if (state?.status === "review_ready") return [CONTINUE, CONTINUE_ALL, ...(state.stopped && !state.accepted ? [] : [FINISH]), RETRY, RESTART];
     if (state?.status === "complete" && state.review_unit) return [RETRY, RESTART];
     return [];
 }
@@ -93,7 +94,7 @@ function statusPanel(node, state, preview = false) {
         const item = node.addDOMWidget("sequence_status", "h3_external_status", host, { serialize: false, tooltip: "Planned duration and canonical backend chunk progress. Finish here omits remaining chunks." });
         item.serialize = false;
         item.options ||= {}; item.options.serialize = false;
-        item.computeSize = () => [300, 152];
+        item.computeSize = () => [300, 176];
         node._externalStatusHost = host;
         node.setSize?.(node.computeSize());
     }
@@ -121,7 +122,7 @@ function statusPanel(node, state, preview = false) {
     const bar = create("div", "", "height:5px;background:#344c3d;border-radius:4px;margin:9px 0 7px;overflow:hidden");
     const ratio = state.chunks ? Math.min(1, (state.completed || 0) / state.chunks) : 0;
     bar.append(create("div", "", `height:100%;width:${ratio*100}%;background:${color};border-radius:4px`)); panel.append(bar);
-    const label = preview ? "Ready · choose a mode and Queue" : state.status === "complete" ? `Complete · ${state.completed_seconds ?? ""} s${state.skipped ? ` · ${state.skipped} chunks omitted` : ""}` : state.status === "review_ready" ? `Chunk ${state.completed} ready · choose an action below` : running ? `Running chunk ${state.current ?? "—"} / ${state.chunks}` : "Waiting for backend status";
+    const label = preview ? "Ready · choose a mode and Queue" : state.stopped ? `Stopped at chunk ${state.current ?? state.completed} · kept ${state.completed}` : state.status === "complete" ? `Complete · ${state.completed_seconds ?? ""} s${state.skipped ? ` · ${state.skipped} chunks omitted` : ""}` : state.status === "review_ready" ? `Chunk ${state.completed} ready · choose an action below` : running ? `Running chunk ${state.current ?? "—"} / ${state.chunks}` : "Waiting for backend status";
     panel.append(create("div", label + (state.storage_mode === FRAME_STORAGE ? " · Frames on disk" : ""), "font-size:11px;color:"+color));
     host.append(panel);
     node.setDirtyCanvas?.(true, true);
@@ -162,6 +163,9 @@ function refreshStart(node) {
 
 function updatePanel(node, state, presentationOnly = false) {
     if (!state || !["review_ready", "complete", "in_progress"].includes(state.status)) return;
+    const control = node._externalControl;
+    if (control?.stop_requested && (control.running || !control.ready || (state.control_token === control.token && !state.stopped))) return;
+    if (control?.stop_requested && !state.control_token && !state.stopped) node._externalControl = null;
     node._externalReviewState = state;
     node.widgets = (node.widgets || []).filter((widget) => !widget._externalReview);
     const add = (type, name, value, callback, tooltip, extra = {}) => {
@@ -183,8 +187,31 @@ function updatePanel(node, state, presentationOnly = false) {
         statusPanel(node, state.progress);
         if (linkedStart) statusPanel(linkedStart, state.progress);
     }
-    const label = state.status === "complete" ? "Saved sequence is complete" : state.status === "review_ready" ? `Chunk ${state.accepted} is ready for review` : `Generating ${state.accepted}/${state.chunks} chunks`;
+    const label = state.stopped && state.review_unit?.pending ? `Stopped during Chunk ${state.review_unit.chunk} · kept ${state.accepted} chunks` : state.status === "complete" ? "Saved sequence is complete" : state.status === "review_ready" ? `Chunk ${state.accepted} is ready for review` : `Generating ${state.accepted}/${state.chunks} chunks`;
     add("text", "Review status", label, () => {}, "Canonical saved backend status. Review controls are never inferred from visible widget values.");
+    if (control?.running && !control.complete) {
+        const button = add("button", control.stop_requested ? "Stopping…" : "Stop", null, async () => {
+            if (node._externalControl?.stop_requested) return;
+            const token = node._externalControl.token;
+            node._externalControl = { ...node._externalControl, stop_requested: true };
+            button.name = "Stopping…";
+            widget(node, "Review status").value = "Stopping this run · preserving completed chunks…";
+            node.setDirtyCanvas?.(true, true);
+            try {
+                const response = await api.fetchApi("/design61/external-sequence/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) });
+                const packet = await response.json();
+                if (!response.ok) throw Error(packet.error || "Stop request failed");
+                applyControlPacket(packet, token);
+            } catch (error) {
+                reviewError(node, `Stop: ${error?.message || error}`);
+                node._externalControl = { ...node._externalControl, stop_requested: false };
+                button.name = "Stop";
+            }
+        }, "Interrupt only this Full Video run. Preserve committed chunks and continuation tails, discard the unfinished chunk, then switch to Review. Wait for Core to finish interrupting before Retry/Continue.");
+        node.setSize(node.computeSize());
+        node.setDirtyCanvas(true, true);
+        return;
+    }
     const selectedMode = presentationOnly ? find("generation_mode")?.value || state.mode : state.mode || find("generation_mode")?.value;
     const queueAction = async (label, restartChunk) => {
             // Resolve again at click time: connections/widgets can be replaced
@@ -199,10 +226,17 @@ function updatePanel(node, state, presentationOnly = false) {
             command.value = label;
             const reference = externalReviewReference(state, restartChunk);
             expected.value = reference;
+            const previousControl = node._externalControl;
+            if (previousControl) {
+                clearTimeout(controlTimers.get(previousControl.token));
+                controlTimers.delete(previousControl.token);
+                node._externalControl = null;
+            }
             node.setDirtyCanvas?.(true, true);
             try {
                 await app.queuePrompt(0, 1);
             } catch (error) {
+                node._externalControl ||= previousControl;
                 reviewError(node, `Could not queue ${label}: ${error?.message || error}`);
             } finally {
                 // Do not leave a Review command armed for the blue Queue button.
@@ -244,8 +278,60 @@ function updatePanel(node, state, presentationOnly = false) {
     node.setDirtyCanvas(true, true);
 }
 
+const controlTimers = new Map();
+export function applyControlPacket(packet, expectedToken = null) {
+    const graph = app.graph;
+    if (!packet?.token || !graph) return;
+    for (const id of packet.end_ids || []) {
+        const node = graph.getNodeById?.(id);
+        const start = node && findExternalSequenceStart(node);
+        if (!node || (node.comfyClass || node.type) !== END || String(start?.id) !== packet.start_id) continue;
+        // A late poll/event from a stopped run cannot replace a newer run.
+        const old = node._externalControl;
+        if (expectedToken && old?.token !== expectedToken) continue;
+        if (packet.epoch && packet.epoch === old?.epoch && packet.order < old.order) continue;
+        if (old?.token === packet.token && packet.serial < old.serial) continue;
+        if (old?.token !== packet.token && old?.running && packet.stop_requested) continue;
+        node._externalControl = packet;
+        if (packet.stop_requested) {
+            if (packet.running || !packet.ready) {
+                node.widgets = (node.widgets || []).filter(item => !item._externalReview);
+                const item = node.addWidget("button", "Stopping…", null, () => {}, {serialize:false,tooltip:"Core is interrupting this run. Completed chunks remain saved. Review actions become available after the old prompt exits."});
+                item._externalReview = true; item.serialize = false;
+                node.setSize?.(node.computeSize()); node.setDirtyCanvas?.(true, true);
+                continue;
+            }
+            const mode = widget(start, "generation_mode");
+            if (mode) mode.value = REVIEW;
+            refreshStart(start);
+        }
+        updatePanel(node, packet.state);
+    }
+    clearTimeout(controlTimers.get(packet.token));
+    controlTimers.delete(packet.token);
+    if (packet.running || (packet.stop_requested && !packet.ready)) {
+        controlTimers.set(packet.token, setTimeout(async () => {
+            controlTimers.delete(packet.token);
+            try {
+                const response = await api.fetchApi(`/design61/external-sequence/control/${packet.token}`);
+                const next = await response.json();
+                if (!response.ok) throw Error(next.error || "Could not read run status");
+                applyControlPacket(next, packet.token);
+            } catch (error) {
+                for (const id of packet.end_ids || []) {
+                    const node = graph.getNodeById?.(id);
+                    if (node?._externalControl?.token === packet.token) reviewError(node, `Run status: ${error?.message || error}`);
+                }
+            }
+        }, 1000));
+    }
+}
+
 app.registerExtension({
     name: "design61.ExternalSamplingReview",
+    setup() {
+        api.addEventListener("design61.external_control", event => applyControlPacket(event.detail));
+    },
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === CONDITIONING) {
             for (const hook of ["onNodeCreated", "onConfigure", "onConnectionsChange", "onDrawForeground"]) {
@@ -295,7 +381,9 @@ app.registerExtension({
             const executed = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function(message) {
                 executed?.apply(this, arguments);
-                if (message?.external_progress?.[0]) statusPanel(this, message.external_progress[0]);
+                const progress = message?.external_progress?.[0];
+                const old = this._externalProgress;
+                if (progress && !(progress.control_token && progress.control_token === old?.control_token && progress.completed < old.completed)) statusPanel(this, progress);
                 if (widget(this, "review_action")) widget(this, "review_action").value = RESUME;
                 if (widget(this, "expected_revision")) widget(this, "expected_revision").value = "";
             };
@@ -305,7 +393,10 @@ app.registerExtension({
         const previous = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (message) {
             previous?.apply(this, arguments);
-            updatePanel(this, message?.external_review?.[0]);
+            const state = message?.external_review?.[0];
+            if (state?.control_token && this._externalControl && state.control_token !== this._externalControl.token) return;
+            if (state?.mode === "Full Video" && this._externalControl?.running && state.accepted < this._externalControl.state?.accepted) return;
+            updatePanel(this, state);
         };
     },
 });

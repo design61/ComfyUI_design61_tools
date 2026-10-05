@@ -29,6 +29,8 @@ Review 期间可以修改上游提示词，再用 End 的按钮执行：重试�
 
 End 的 `Continue all remaining chunks` 可在逐段 Review 中接受当前段，并自动生成全部剩余段，无需改 Start 的模式。`Restart from chunk` 下拉框列出当前序列已接受的段；选择第 3 段后点击 `Regenerate from selected chunk`，会保留前两段并重做第三段，成功后旧的第 4、5 等后续段退出当前序列，需要重新生成。
 
+`Full Video` 运行中，End 提供 **Stop** 按钮。点击后使用 ComfyUI 的正常中断机制停止这次运行，保留已保存的段，并将 Start 切到 `Review Each Chunk`。等本次运行退出后，End 恢复继续、重跑、提前结束和选择历史段重做的操作。例如第三段还没保存完时停止，会保留第一、二段，重跑当前段仍从第三段开始；若第三段已经保存，则也保留第三段，可以选择重做它。支持两种存储模式；Stop 本身不删除已保存的素材。采样器需到达 ComfyUI 中断检查点后才能完全停下，等待期间显示 `Stopping…`。
+
 **长视频可选分段落盘模式**：Start 的 `storage_mode` 选 `Frames + tail State (disk)`，End 接入视频 VAE。每段完成后只解码这一段，将有效 PNG 帧和续写尾部 State 存到磁盘；下一段读取上一段的 State。End 的 `frames_path` 接到本工具集的文件夹序列帧 FFmpeg 节点，`audio` 接它的音频输入，就可以合成已完成的片段。默认目录是 ComfyUI 的 `output/design61_sequences`，不使用系统临时目录。
 
 原有 `Latents (existing)` 模式继续支持 Decode／Finalize，保留完整历史 Takes。新的落盘模式用于节省解码内存：新结果成功提交后，会删除被替代段及其后续段的帧和尾部 State，保留更早的段；生成失败时保留原结果。详细接线与区别见[分段存帧说明](docs/H3_EXTERNAL_SAMPLING.md#分段存帧与-ffmpeg-合成)。

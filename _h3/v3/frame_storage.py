@@ -188,6 +188,8 @@ class FrameReviewStore(ExternalReviewStore):
 
     def commit_frames(self, flow, entry, video_vae, audio_vae=None, driving_audio=None):
         from PIL import Image
+        from .external_control import guard_stop
+        guard_stop(flow)
         entry = validate_chunk_entry(entry)
         plan = entry["plan"]
         if entry["clip_index"] != len(flow["entries"]) + 1 or (plan["width"], plan["height"]) != (entry["video"].shape[-1]*16, entry["video"].shape[-2]*16):
@@ -204,6 +206,7 @@ class FrameReviewStore(ExternalReviewStore):
             if not torch.is_tensor(images) or images.ndim != 4 or tuple(images.shape[:3]) != (plan["total_frames"], plan["height"], plan["width"]) or images.shape[-1] not in (3, 4):
                 raise StateValidationError("decoded video cannot be assembled with its declared physical frame plan")
             for number, frame in enumerate(images[plan["trim_frames"]:plan["total_frames"]]):
+                guard_stop(flow)
                 if not bool(torch.isfinite(frame).all()):
                     raise StateValidationError("decoded video frame contains NaN or Inf")
                 pixels = frame.detach().to("cpu").clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
@@ -231,13 +234,17 @@ class FrameReviewStore(ExternalReviewStore):
                       "plan": plan, "prompt": entry["prompt"], "prompt_hash": entry["prompt_hash"],
                       "execution_contract": flow.get("execution_contract", self.contract), "audio_rate": rate if sound is not None else None,
                       "audio_channels": sound.shape[1] if sound is not None else None}
+            if flow.get("_control"):
+                record["execution_token"] = flow["_control"]
             lock = _RunLock(self.root / ".lock")
             lock.acquire()
             try:
+                guard_stop(flow)
                 index = self.index()
                 if index["head"] != flow["expected_head"] or canonical_revision(index) != flow["expected_revision"]:
                     raise RunStorageError("external review head changed during Sampling; refusing to overwrite another accepted Take")
                 index["records"][revision] = record
+                index.pop("stopped", None)
                 complete = entry["clip_index"] >= flow["target_chunks"]
                 status = "complete" if complete else "review_ready" if flow["mode"] == REVIEW else "in_progress"
                 index.update(head=revision, revision=revision, mode=flow["mode"], status=status,
@@ -312,6 +319,8 @@ class FrameReviewStore(ExternalReviewStore):
 def end_frame_sequence(*, flow, samples=None, plan=None, video_vae=None, audio_vae=None, driving_audio=None, dynprompt=None, unique_id=None):
     from comfy_execution.graph import ExecutionBlocker
     from .external_sequence import expand_next_iteration, review_payload
+    from .external_control import guard_stop, track_commit
+    guard_stop(flow)
     store = FrameReviewStore(flow["run_name"], flow["contract"], flow["frame_root"])
     if flow["active"]:
         text = flow["prompts"][len(flow["entries"])]
@@ -319,6 +328,8 @@ def end_frame_sequence(*, flow, samples=None, plan=None, video_vae=None, audio_v
                                  seed=derive_chunk_seed(flow["base_seed"], len(flow["entries"]), flow["nonce"]),
                                  context_frames=int(plan["trim_frames"]), motion_score=0.0, reused=False)
         index = store.commit_frames(flow, entry, video_vae, audio_vae, driving_audio)
+        track_commit(flow, index)
+        guard_stop(flow)
     else:
         index = store.index()
     entries = tuple(store.entries(index))
