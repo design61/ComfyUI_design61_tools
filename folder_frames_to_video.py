@@ -1084,7 +1084,9 @@ def create_video_ui_info(
                 "/",
             )
 
-            ui["videos"] = [
+            # Same media contract as Core PreviewVideo: history and the queue
+            # sidebar read `images` for videos too, with an animated marker.
+            ui["images"] = [
 
                 {
                     "filename":
@@ -1096,12 +1098,9 @@ def create_video_ui_info(
                     "type":
                         "output",
 
-                    "format":
-                        target.suffix
-                        .lower()
-                        .lstrip("."),
                 }
             ]
+            ui["animated"] = [True]
 
     except Exception:
         pass

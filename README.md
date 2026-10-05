@@ -13,6 +13,8 @@
 
 使用前需要准备 FFmpeg。节点依次查找：指定的 FFmpeg 路径、插件内的 `ffmpeg` 目录、系统 PATH。本包不包含 FFmpeg 二进制。
 
+视频保存到 ComfyUI 输出目录及其子目录时，会按标准视频结果格式进入任务队列的「已完成」列表，并提供预览。自定义保存到输出目录之外的绝对路径仍可使用，但 ComfyUI 的标准预览接口无法读取那里，节点会返回实际文件路径和保存状态。
+
 ## 2. 搭配 H3 Continuum，通过自定义采样生成长视频
 
 本功能用于搭配 [**ComfyUI-H3-Continuum**](https://github.com/ukr8b3g-cmyk/ComfyUI-H3-Continuum)，使用它的分段续写能力生成长视频。具体功能和实现原理请查看原插件项目。
