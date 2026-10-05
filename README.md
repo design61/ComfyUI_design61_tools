@@ -1,6 +1,6 @@
 # ComfyUI_design61_tools
 
-这是一个 **ComfyUI 节点工具集**，用于收纳 design61 自制和二次修改的节点。目前包含两个功能：
+这是一个 **ComfyUI 节点工具集**，用于收纳 design61 自制和二次修改的节点。目前包含文件夹序列帧转视频、H3 自定义采样长视频，以及可选的 NInfer 显存交接设置。
 
 ## 1. 根据路径，把文件夹内的序列帧转成视频
 
@@ -47,6 +47,16 @@ End 的 `Continue all remaining chunks` 可在逐段 Review 中接受当前段�
 这是 design61 提供的单采案例，可以从它开始了解连接方式，再按需要扩展成双采或 latent 二采放大。工作流保留原有接线和参数，公开副本仅恢复了 Core 节点的标准显示名称。
 
 案例依赖和使用说明见 [examples/README.md](examples/README.md)。更详细的拆分节点连接方式见 [H3 自定义采样进阶说明](docs/H3_EXTERNAL_SAMPLING.md)。
+
+## 3. NInfer 显存交接设置
+
+如果同一张显卡同时运行 NInfer 和 ComfyUI，可以使用 **NInfer 显存交接设置_design61** 节点。它在 ComfyUI 任务入队前请求本地 NInfer supervisor 释放显存，提交结束后归还交接 lease；仍需搭配支持 `/_agent/yield` 和 `/_agent/settle` 的 NInfer supervisor。
+
+添加节点，填写 NInfer 的 `agent-sharing-bridge.json` 完整路径，打开 `enabled`，点击节点内 **保存参数（删除节点后仍生效）**。保存后可以删除节点，不需要接线或运行此节点。重新添加节点可查看、修改或关闭设置。
+
+配置保存在 ComfyUI 用户目录的 `design61_tools/ninfer-sharing.json`，更新插件或删除节点不会清除。默认关闭；令牌只从本机 bridge 文件读取，不写入节点、工作流或本项目。未启动 supervisor 时不进行交接；正在运行但交接失败时返回原钩子的错误，避免两边同时占用显存。
+
+如果以前单独安装过 `ninfer_agent_sharing`，迁移后应禁用旧钩子目录，避免重复交接。本工具不附带 NInfer 本体，也不会安装或改写其程序。
 
 ## 安装
 

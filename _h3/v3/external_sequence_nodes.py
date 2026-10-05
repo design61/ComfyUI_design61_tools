@@ -1,6 +1,6 @@
 """Visible automatic-sequence and Review controls around editable external nodes."""
 from ..constants import CONTINUITY_OPTIONS, PROMPT_FORMAT_AUTO, PROMPT_FORMAT_OPTIONS
-from .external_sequence import ACTIONS, LEGACY_FINISH, FULL, REVIEW, begin_sequence, end_sequence, sequence_progress
+from .external_sequence import ACTIONS, LEGACY_FINISH, FULL, REVIEW, begin_sequence, end_sequence, sequence_progress, expanded_output_packet
 from .frame_storage import LATENTS, FRAMES, end_frame_sequence
 
 CATEGORY = "MiniMax H3/Continuum/External Sampling"
@@ -26,7 +26,7 @@ class H3ContinuumExternalSequenceStart_design61:
             "storage_mode": ([LATENTS, FRAMES], {"default": LATENTS, "tooltip": "Latents preserves the existing Decode/Finalize workflow. Frames decodes only the current chunk, saves PNGs and continuation tail State, and outputs a folder for the design61 FFmpeg node. Choose before starting a new run; Review stays in its original storage mode."}),
             "frame_root": ("STRING", {"default": "", "tooltip": "Frames storage directory. Empty uses ComfyUI output/design61_sequences; relative paths are beneath output. Store on a disk with space. Regeneration deletes superseded frames/tails after the replacement commits; existing latent Sessions are untouched."}),
         },
-            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"}}
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID", "execution_list": "EXECUTION_LIST"}}
     RETURN_TYPES = ("H3_CONTINUUM_EXTERNAL_FLOW", "H3_CONTINUUM_STATE", "H3_CONTINUUM_EXTERNAL_SEQUENCE", "STRING", "INT", "INT")
     RETURN_NAMES = ("flow", "previous_state", "previous_sequence", "prompt", "seed", "physical_frames")
     FUNCTION = "start"
@@ -35,6 +35,10 @@ class H3ContinuumExternalSequenceStart_design61:
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
     def start(self, **kwargs):
+        execution_list = kwargs.pop("execution_list", None)
+        iteration = kwargs.get("iteration")
+        if isinstance(iteration, dict) and "_external_output_source" in iteration:
+            return expanded_output_packet(iteration, execution_list, kwargs.get("unique_id"))
         result = begin_sequence(**kwargs)
         return {"ui": {"external_progress": [sequence_progress(result[0])]}, "result": result}
 

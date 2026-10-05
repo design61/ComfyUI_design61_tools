@@ -328,6 +328,19 @@ def review_payload(flow, index):
             "history": [{"revision": key, "chunk": record["chunk"], "seed": record["seed"], **({"discarded": True} if record.get("discarded") else {})} for key, record in records.items()]}
 
 
+def expanded_output_packet(iteration, execution_list, unique_id):
+    """Keep list-valued End sockets inside scalar expansion result packets.
+
+    Core resolves each dynamic result link by flattening its cached socket.
+    Directly linking a LATENT list would turn its members into output sockets.
+    The status dependency makes the completed End cache available through the
+    public ExecutionList API; this private Start invocation never starts a run.
+    """
+    cached = execution_list.get_cache(iteration["_external_output_source"], unique_id)
+    values = cached.outputs
+    return (values[0], values[1], values[2][0], values[3][0], values[4][0], 0)
+
+
 def expand_next_iteration(dynprompt, end_id, next_flow):
     """Replay the editable graph between Start and End through public Core APIs."""
     from comfy_execution.graph_utils import GraphBuilder, is_link
@@ -357,8 +370,13 @@ def expand_next_iteration(dynprompt, end_id, next_flow):
         for name, value in ancestors[key]["inputs"].items():
             clone.set_input(name, clones[value[0]].out(value[1]) if is_link(value) and value[0] in clones else value)
     clones[start_id].set_input("iteration", next_flow)
-    count = 7 if next_flow.get("storage_mode") == "Frames + tail State (disk)" else 5
-    return builder.finalize(), tuple(clones[end_id].out(slot) for slot in range(count))
+    if next_flow.get("storage_mode") == "Frames + tail State (disk)":
+        return builder.finalize(), tuple(clones[end_id].out(slot) for slot in range(7))
+    packet = builder.node(START, id=end_id + ".__output_packet",
+                          iteration={"_external_output_source": clones[end_id].id},
+                          sequence_prompt=clones[end_id].out(4))
+    packet.set_override_display_id(dynprompt.get_display_node_id(end_id))
+    return builder.finalize(), tuple(packet.out(slot) for slot in range(5))
 
 
 def end_sequence(*, flow, samples=None, plan=None, dynprompt=None, unique_id=None, driving_audio=None):
