@@ -12,6 +12,7 @@ const FINISH = "Finish here";
 const RESTART = "Start again from Chunk 1";
 const CONTINUE_ALL = "Continue all remaining chunks";
 const REGENERATE_FROM = "Regenerate from selected chunk";
+const FRAME_STORAGE = "Frames + tail State (disk)";
 const widget = (node, name) => node.widgets?.find((item) => item.name === name);
 
 export function findExternalSequenceStart(node) {
@@ -51,7 +52,7 @@ export function externalReviewActions(state) {
 }
 
 export function externalReviewReference(state, restartChunk) {
-    return state.contract || restartChunk != null ? JSON.stringify({ revision: state.revision, contract: state.contract, run_name: state.run_name, restart_chunk: restartChunk }) : state.revision;
+    return state.contract || restartChunk != null ? JSON.stringify({ revision: state.revision, contract: state.contract, run_name: state.run_name, restart_chunk: restartChunk, ...(state.storage_mode ? {storage_mode: state.storage_mode} : {}), ...(state.storage_mode === FRAME_STORAGE ? {frame_root: state.frame_root} : {}) }) : state.revision;
 }
 
 export function bindExternalConditioningFlow(node) {
@@ -121,7 +122,7 @@ function statusPanel(node, state, preview = false) {
     const ratio = state.chunks ? Math.min(1, (state.completed || 0) / state.chunks) : 0;
     bar.append(create("div", "", `height:100%;width:${ratio*100}%;background:${color};border-radius:4px`)); panel.append(bar);
     const label = preview ? "Ready · choose a mode and Queue" : state.status === "complete" ? `Complete · ${state.completed_seconds ?? ""} s${state.skipped ? ` · ${state.skipped} chunks omitted` : ""}` : state.status === "review_ready" ? `Chunk ${state.completed} ready · choose an action below` : running ? `Running chunk ${state.current ?? "—"} / ${state.chunks}` : "Waiting for backend status";
-    panel.append(create("div", label, "font-size:11px;color:"+color));
+    panel.append(create("div", label + (state.storage_mode === FRAME_STORAGE ? " · Frames on disk" : ""), "font-size:11px;color:"+color));
     host.append(panel);
     node.setDirtyCanvas?.(true, true);
 }
@@ -129,15 +130,17 @@ function statusPanel(node, state, preview = false) {
 function refreshStart(node) {
     for (const name of ["review_action", "expected_revision"]) hidden(node, name, true);
     const mode = widget(node, "generation_mode");
+    const storage = widget(node, "storage_mode")?.value;
+    hidden(node, "frame_root", storage !== FRAME_STORAGE);
     if (mode?.value === "Review by Chunk") mode.value = REVIEW;
     if (widget(node, "review_action")?.value === "Use it and finish the rest") widget(node, "review_action").value = FINISH;
     const linked = (name) => node.inputs?.some((item) => item.name === name && item.link != null);
     const count = linked("chunks") ? NaN : Number(widget(node, "chunks")?.value);
     const seconds = linked("chunk_seconds") ? NaN : Number(widget(node, "chunk_seconds")?.value);
-    const key = JSON.stringify([count, seconds, mode?.value]);
+    const key = JSON.stringify([count, seconds, mode?.value, storage]);
     if (node._externalPreviewKey !== key) {
         node._externalPreviewKey = key;
-        statusPanel(node, { chunks: Number.isFinite(count) ? count : null, completed: 0, current: 1, remaining: Number.isFinite(count) ? count : null, total_seconds: count*seconds, mode: mode?.value }, true);
+        statusPanel(node, { chunks: Number.isFinite(count) ? count : null, completed: 0, current: 1, remaining: Number.isFinite(count) ? count : null, total_seconds: count*seconds, mode: mode?.value, storage_mode: storage }, true);
         const pending = [node];
         const visited = new Set();
         while (pending.length) {
@@ -169,6 +172,8 @@ function updatePanel(node, state, presentationOnly = false) {
         return widget;
     };
     const linkedStart = findExternalSequenceStart(node);
+    const framesOnDisk = state.storage_mode === FRAME_STORAGE;
+    const historyHelp = framesOnDisk ? "Frame-mode history records. Superseded media/tails are deleted after replacement commits; earlier active chunks remain." : "Read-only immutable Take history for this external graph lineage. This panel does not select or overwrite a Take.";
     const find = (name) => linkedStart?.widgets?.find((widget) => widget.name === name);
     const action = find("review_action");
     const revision = find("expected_revision");
@@ -209,7 +214,7 @@ function updatePanel(node, state, presentationOnly = false) {
             }
     };
     for (const label of externalReviewActions({ ...state, mode: selectedMode })) {
-        add("button", label, null, () => queueAction(label), label === CONTINUE_ALL ? "Keep all accepted chunks and automatically generate every remaining chunk without Review pauses. Uses updated upstream prompts. Normal blue Queue still starts fresh." : label === FINISH ? "Finalize only accepted chunks now. No remaining chunk is sampled." : label === RESTART ? "Generate again from chunk 1 with a new seed nonce; all old Takes remain stored." : label === RETRY ? "Generate a new Take for this chunk, preserving the accepted prefix and old Take." : "Accept this chunk and execute exactly the next chunk. Its index and media window advance automatically.");
+        add("button", label, null, () => queueAction(label), label === CONTINUE_ALL ? "Keep all accepted chunks and automatically generate every remaining chunk without Review pauses. Uses updated upstream prompts. Normal blue Queue still starts fresh." : label === FINISH ? "Finalize only accepted chunks now. No remaining chunk is sampled." : label === RESTART ? (framesOnDisk ? "Generate again from chunk 1. After the new first chunk commits, previous frame-mode media/tails are removed." : "Generate again from chunk 1 with a new seed nonce; all old Takes remain stored.") : label === RETRY ? (framesOnDisk ? "Regenerate this chunk, preserving earlier chunks. Replace its old frames/tail only after the new chunk commits." : "Generate a new Take for this chunk, preserving the accepted prefix and old Take.") : "Accept this chunk and execute exactly the next chunk. Its index and media window advance automatically.");
     }
     const chunks = state.accepted_chunks || [];
     if (selectedMode !== "Full Video" && ["review_ready", "complete"].includes(state.status) && chunks.length) {
@@ -217,23 +222,23 @@ function updatePanel(node, state, presentationOnly = false) {
         node._externalRestartChunk = selected;
         const choice = add("combo", "Restart from chunk", `Chunk ${selected}`, value => {
             node._externalRestartChunk = Number(String(value).replace("Chunk ", ""));
-        }, "Choose an already accepted chunk. Regeneration keeps only its earlier prefix in the active sequence; old later Takes remain in History.", { values: chunks.map(number => `Chunk ${number}`) });
+        }, framesOnDisk ? "Choose an accepted chunk. Keep earlier chunks; after replacement succeeds, delete the old selected/later chunk frames and tails." : "Choose an already accepted chunk. Regeneration keeps only its earlier prefix in the active sequence; old later Takes remain in History.", { values: chunks.map(number => `Chunk ${number}`) });
         add("button", REGENERATE_FROM, null, () => {
             const target = Number(String(choice.value).replace("Chunk ", ""));
             return queueAction(REGENERATE_FROM, target);
-        }, "Regenerate the selected chunk using current prompts, then pause for Review. Later old chunks leave the active sequence when this Take succeeds; continue to regenerate following chunks. History stays intact.");
+        }, "Regenerate the selected chunk using current prompts, then pause for Review. Later old chunks leave the active sequence when this Take succeeds; continue to regenerate following chunks. " + historyHelp);
     }
     if (state.history?.length && selectedMode !== "Full Video") {
         add("button", `Render History — ${state.history.length} Takes`, null, () => {
             const existing = node.widgets.find((widget) => widget._externalHistory);
             if (existing) node.widgets = node.widgets.filter((widget) => widget !== existing);
             else {
-                const history = add("text", "Saved Takes", state.history.map((item) => `Chunk ${item.chunk}: ${item.revision.slice(0, 8)} / seed ${item.seed}`).join(" | "), () => {}, "Read-only immutable Take history for this external graph lineage. This panel does not select or overwrite a Take.");
+                const history = add("text", "Saved Takes", state.history.map((item) => `Chunk ${item.chunk}: ${item.revision.slice(0, 8)} / seed ${item.seed}${item.discarded ? " / media removed" : ""}`).join(" | "), () => {}, historyHelp);
                 history._externalHistory = true;
             }
             node.setSize(node.computeSize());
             node.setDirtyCanvas(true, true);
-        }, "Show or hide the saved external sequence's immutable Take history.");
+        }, historyHelp);
     }
     node.setSize(node.computeSize());
     node.setDirtyCanvas(true, true);

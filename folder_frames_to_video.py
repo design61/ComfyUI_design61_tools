@@ -1333,7 +1333,20 @@ class FolderFramesToVideoFFmpeg_design61:
 
     # ========================================================
 
-    def run(
+    def run(self, *args, **kwargs):
+        from ._h3.v3.frame_storage import pin_frame_view
+        value = kwargs.get("frames_path", args[0] if args else "")
+        pin = None
+        image = kwargs.get("image", args[19] if len(args) > 19 else None)
+        if image is None and value:
+            pin = pin_frame_view(resolve_frames_path(value))
+        try:
+            return self._run(*args, **kwargs)
+        finally:
+            if pin is not None:
+                pin.unlink(missing_ok=True)
+
+    def _run(
         self,
 
         frames_path,

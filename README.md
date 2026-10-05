@@ -23,9 +23,13 @@
 
 保留自动多段和逐段 Review：可以接受当前段并继续、到当前段结束、重试当前段，或者从第一段重新开始。素材辅助节点继续使用原版插件，支持按 chunk 选择参考图、驱动音频和 VAE、视频序列帧以及参考音频合集。
 
-Review 期间可以修改上游提示词，再用 End 的按钮执行：重试当前段会保留之前已接受的片段，继续则读取修改后的下一段提示词。点击 ComfyUI 蓝色运行按钮会从第一段开始新一轮，旧 Takes 仍保留。
+Review 期间可以修改上游提示词，再用 End 的按钮执行：重试当前段会保留之前已接受的片段，继续则读取修改后的下一段提示词。点击 ComfyUI 蓝色运行按钮会从第一段开始新一轮。
 
-End 的 `Continue all remaining chunks` 可在逐段 Review 中接受当前段，并自动生成全部剩余段，无需改 Start 的模式。`Restart from chunk` 下拉框列出当前序列已接受的段；选择第 3 段后点击 `Regenerate from selected chunk`，会保留前两段并重做第三段，成功后旧的第 4、5 等后续段退出当前序列，需要重新生成，历史 Takes 保留。
+End 的 `Continue all remaining chunks` 可在逐段 Review 中接受当前段，并自动生成全部剩余段，无需改 Start 的模式。`Restart from chunk` 下拉框列出当前序列已接受的段；选择第 3 段后点击 `Regenerate from selected chunk`，会保留前两段并重做第三段，成功后旧的第 4、5 等后续段退出当前序列，需要重新生成。
+
+**长视频可选分段落盘模式**：Start 的 `storage_mode` 选 `Frames + tail State (disk)`，End 接入视频 VAE。每段完成后只解码这一段，将有效 PNG 帧和续写尾部 State 存到磁盘；下一段读取上一段的 State。End 的 `frames_path` 接到本工具集的文件夹序列帧 FFmpeg 节点，`audio` 接它的音频输入，就可以合成已完成的片段。默认目录是 ComfyUI 的 `output/design61_sequences`，不使用系统临时目录。
+
+原有 `Latents (existing)` 模式继续支持 Decode／Finalize，保留完整历史 Takes。新的落盘模式用于节省解码内存：新结果成功提交后，会删除被替代段及其后续段的帧和尾部 State，保留更早的段；生成失败时保留原结果。详细接线与区别见[分段存帧说明](docs/H3_EXTERNAL_SAMPLING.md#分段存帧与-ffmpeg-合成)。
 
 | 拆分节点 | 功能 |
 | --- | --- |

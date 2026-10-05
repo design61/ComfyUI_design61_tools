@@ -44,6 +44,7 @@ def sequence_progress(flow, index=None):
         active = False
         status = index["status"]
     return {"mode": flow["mode"], "status": status, "chunks": flow["chunks"],
+            "storage_mode": flow.get("storage_mode", "Latents (existing)"),
             "completed": completed, "current": completed + 1 if active else completed if status == "review_ready" else None,
             "remaining": max(0, flow["chunks"]-completed) if status != "complete" else 0,
             "skipped": max(0, flow["chunks"]-completed) if status == "complete" else 0,
@@ -82,13 +83,21 @@ def review_reference(value):
     return str(reference.get("revision") or ""), contract, reference.get("run_name")
 
 
-def review_store(run_name, execution_contract, expected_revision):
+def sequence_store(run_name, contract, storage_mode="Latents (existing)", frame_root=""):
+    if storage_mode == "Frames + tail State (disk)":
+        from .frame_storage import FrameReviewStore
+        return FrameReviewStore(run_name, contract, frame_root)
+    return ExternalReviewStore(run_name, contract)
+
+
+def review_store(run_name, execution_contract, expected_revision, storage_mode="Latents (existing)", frame_root=""):
     revision, anchor, anchor_name = review_reference(expected_revision)
     if anchor:
         name = str(anchor_name) if anchor_name is not None else run_name
-        return ExternalReviewStore(name, anchor), name, revision
-    store = ExternalReviewStore(run_name, execution_contract)
-    if revision and canonical_revision(store.index()) != revision:
+        reference = json.loads(expected_revision)
+        return sequence_store(name, anchor, reference.get("storage_mode", storage_mode), reference.get("frame_root", frame_root)), name, revision
+    store = sequence_store(run_name, execution_contract, storage_mode, frame_root)
+    if storage_mode != "Frames + tail State (disk)" and revision and canonical_revision(store.index()) != revision:
         # A panel drawn by the previous frontend carries only a revision. Find
         # that existing lineage by its saved revision, without loading tensors
         # or changing any index. UUID revisions uniquely identify their store.
@@ -208,7 +217,7 @@ class ExternalReviewStore:
 
 def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_prompt, prompt_mode,
                    generation_mode, review_action, run_name, expected_revision="", prompt=None,
-                   unique_id=None, iteration=None):
+                   unique_id=None, iteration=None, storage_mode="Latents (existing)", frame_root=""):
     if iteration is not None:
         flow = dict(iteration)
     else:
@@ -220,9 +229,13 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
         # Review commands belong to the panel's accepted lineage, even when
         # upstream text changes. Normal Queue has no reference and starts fresh.
         if review_action == ACTIONS[0] and not expected_revision:
-            store, revision = ExternalReviewStore(run_name, execution_contract), ""
+            store, revision = sequence_store(run_name, execution_contract, storage_mode, frame_root), ""
         else:
-            store, run_name, revision = review_store(run_name, execution_contract, expected_revision)
+            store, run_name, revision = review_store(run_name, execution_contract, expected_revision, storage_mode, frame_root)
+        frames_mode = hasattr(store, "commit_frames")
+        storage_mode = "Frames + tail State (disk)" if frames_mode else "Latents (existing)"
+        if frames_mode:
+            frame_root = str(store.root.parent)
         contract = store.contract
         index = store.index()
         entries = store.entries(index)
@@ -275,11 +288,16 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
                 "continuity": continuity, "base_seed": int(base_seed), "prompts": plans["prompts"],
                 "mode": generation_mode, "target_chunks": target_chunks, "entries": tuple(entries),
                 "expected_head": head, "expected_revision": canonical_revision(index), "parent_head": parent_head, "nonce": nonce, "active": active,
-                "status": index["status"], "index": index}
+                "status": index["status"], "index": index, "storage_mode": storage_mode, "frame_root": frame_root}
     entries = flow["entries"]
     position = len(entries)
-    state = entry_to_state(entries[-1]) if entries else None
-    sequence = {"magic": SEQUENCE_MAGIC, "version": 1, "entries": entries} if entries else None
+    if flow.get("storage_mode") == "Frames + tail State (disk)":
+        from .frame_storage import load_tail
+        state = load_tail(entries[-1]) if entries else None
+        sequence = None
+    else:
+        state = entry_to_state(entries[-1]) if entries else None
+        sequence = {"magic": SEQUENCE_MAGIC, "version": 1, "entries": entries} if entries else None
     retained = sum(entry["plan"]["net_frames"] for entry in entries)
     requested_frames = max(1, round((position + 1) * flow["seconds"] * FPS) - retained)
     flow["extend_seconds"] = requested_frames / FPS
@@ -302,11 +320,12 @@ def review_payload(flow, index):
     head = index["head"]
     records = index["records"]
     return {"status": index["status"], "revision": canonical_revision(index), "contract": flow["contract"], "run_name": flow["run_name"], "chunks": flow["chunks"], "mode": flow["mode"],
+            "storage_mode": flow.get("storage_mode", "Latents (existing)"), "frame_root": flow.get("frame_root", ""),
             "accepted": records[head]["chunk"] if head else 0,
             "accepted_chunks": list(range(1, records[head]["chunk"] + 1)) if head else [],
             "review_unit": index.get("review_unit"),
             "progress": sequence_progress(flow, index),
-            "history": [{"revision": key, "chunk": record["chunk"], "seed": record["seed"]} for key, record in records.items()]}
+            "history": [{"revision": key, "chunk": record["chunk"], "seed": record["seed"], **({"discarded": True} if record.get("discarded") else {})} for key, record in records.items()]}
 
 
 def expand_next_iteration(dynprompt, end_id, next_flow):
@@ -338,7 +357,8 @@ def expand_next_iteration(dynprompt, end_id, next_flow):
         for name, value in ancestors[key]["inputs"].items():
             clone.set_input(name, clones[value[0]].out(value[1]) if is_link(value) and value[0] in clones else value)
     clones[start_id].set_input("iteration", next_flow)
-    return builder.finalize(), tuple(clones[end_id].out(slot) for slot in range(5))
+    count = 7 if next_flow.get("storage_mode") == "Frames + tail State (disk)" else 5
+    return builder.finalize(), tuple(clones[end_id].out(slot) for slot in range(count))
 
 
 def end_sequence(*, flow, samples=None, plan=None, dynprompt=None, unique_id=None, driving_audio=None):
