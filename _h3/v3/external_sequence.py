@@ -205,7 +205,8 @@ class ExternalReviewStore:
             status = "complete" if complete else "review_ready" if flow["mode"] == REVIEW else "in_progress"
             index.update(head=revision, revision=revision, mode=flow["mode"], status=status,
                          review_unit={"chunk": entry["clip_index"]} if flow["mode"] == REVIEW else None,
-                         finalized_chunks=flow["target_chunks"] if complete else None)
+                         finalized_chunks=flow["target_chunks"] if complete else None,
+                         chunks=flow["chunks"], seconds=flow["seconds"])
             _write_json(self.path, index)
             return index
         finally:
@@ -300,7 +301,8 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
             active = True
         elif review_action == ACTIONS[5]:
             generation_mode = FULL
-            active = len(entries) < target_chunks and index["status"] != "complete"
+            target_chunks = int(chunks)
+            active = len(entries) < target_chunks
         elif review_action == ACTIONS[6]:
             selected = selected_review_chunk(expected_revision, len(entries))
             active = selected is not None
@@ -322,7 +324,8 @@ def begin_sequence(*, chunks, chunk_seconds, continuity, base_seed, sequence_pro
         elif generation_mode == FULL:
             active = len(entries) < target_chunks and index["status"] != "complete"
         elif review_action == ACTIONS[1]:
-            active = len(entries) < target_chunks and index["status"] != "complete"
+            target_chunks = int(chunks)
+            active = len(entries) < target_chunks
         plans = make_prompt_plan(mode=prompt_mode, script=sequence_prompt, chunks=int(chunks), chunk_seconds=float(chunk_seconds))
         if plans["mode"] == PROMPT_MODE_FIXED:
             plans["prompts"] = [str(sequence_prompt)] * int(chunks)
@@ -372,6 +375,66 @@ def review_payload(flow, index):
             "stopped": bool(index.get("stopped")), "control_token": flow.get("_control"),
             "progress": sequence_progress(flow, index),
             "history": [{"revision": key, "chunk": record["chunk"], "seed": record["seed"], **({"discarded": True} if record.get("discarded") else {})} for key, record in records.items()]}
+
+
+def saved_review_states(reference):
+    """Read canonical saved metadata only; never decode or load latent tensors."""
+    if not isinstance(reference, dict):
+        raise ValueError("Missing saved sequence reference.")
+    name = reference.get("run_name")
+    if not isinstance(name, str) or not name:
+        raise ValueError("Missing sequence run name.")
+    mode = reference.get("storage_mode", "Latents (existing)")
+    if mode not in ("Latents (existing)", "Frames + tail State (disk)"):
+        raise ValueError("Unknown sequence storage mode.")
+    frame_root = reference.get("frame_root", "")
+    anchor = reference.get("contract")
+    if anchor is not None:
+        _, valid, _ = review_reference(json.dumps(reference))
+        if valid is None:
+            raise ValueError("Invalid saved sequence contract.")
+        candidates = [sequence_store(name, valid, mode, frame_root)]
+    else:
+        probe = sequence_store(name, "0" * 64, mode, frame_root)
+        prefix = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+        candidates = []
+        for path in probe.root.parent.glob(prefix + "_*/index.json"):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            contract = value.get("contract")
+            _, valid, _ = review_reference(json.dumps({"contract": contract}))
+            if valid and path.parent.name == prefix + "_" + valid[:16]:
+                candidates.append(sequence_store(name, valid, mode, frame_root))
+    states = []
+    for store in candidates:
+        if not store.path.is_file():
+            continue
+        index = store.index()
+        head = index["head"]
+        if not head:
+            continue
+        # Validate ancestry without opening safetensors or historical images.
+        cursor, visited, count = head, set(), index["records"][head]["chunk"]
+        while cursor:
+            if cursor in visited or cursor not in index["records"]:
+                raise StateValidationError("saved sequence Take ancestry is corrupt")
+            visited.add(cursor)
+            record = index["records"][cursor]
+            if record["chunk"] != count:
+                raise StateValidationError("saved sequence Take chain is not contiguous")
+            count -= 1
+            cursor = record["parent"]
+        if count:
+            raise StateValidationError("saved sequence Take chain is incomplete")
+        flow = {"contract": store.contract, "run_name": name,
+                "chunks": int(index.get("chunks") or reference.get("chunks") or index.get("finalized_chunks") or len(visited)),
+                "seconds": float(index.get("seconds") or reference.get("seconds") or 5.0),
+                "mode": index.get("mode", REVIEW), "storage_mode": mode,
+                "frame_root": str(store.root.parent) if mode == "Frames + tail State (disk)" else "",
+                "entries": (), "active": False, "status": index["status"]}
+        payload = review_payload(flow, index)
+        payload["saved_at"] = store.path.stat().st_mtime
+        states.append(payload)
+    return sorted(states, key=lambda state: state["saved_at"], reverse=True)
 
 
 def expanded_output_packet(iteration, execution_list, unique_id):

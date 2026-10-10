@@ -186,4 +186,12 @@ def install_control_routes():
         except (ValueError, TypeError, AttributeError) as error:
             return web.json_response({"error": str(error)}, status=409)
 
+    @server.routes.post("/design61/external-sequence/review")
+    async def saved_review(request):
+        from .external_sequence import saved_review_states
+        try:
+            return web.json_response({"sequences": await asyncio.to_thread(saved_review_states, await request.json())})
+        except (ValueError, TypeError, KeyError, OSError) as error:
+            return web.json_response({"error": str(error)}, status=409)
+
     server._design61_control_installed = True

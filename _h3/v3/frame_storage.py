@@ -249,7 +249,7 @@ class FrameReviewStore(ExternalReviewStore):
                 status = "complete" if complete else "review_ready" if flow["mode"] == REVIEW else "in_progress"
                 index.update(head=revision, revision=revision, mode=flow["mode"], status=status,
                              review_unit={"chunk": entry["clip_index"]} if flow["mode"] == REVIEW else None,
-                             finalized_chunks=flow["target_chunks"] if complete else None, seconds=flow["seconds"])
+                             finalized_chunks=flow["target_chunks"] if complete else None, seconds=flow["seconds"], chunks=flow["chunks"])
                 active = self.entries(index)
                 if status != "in_progress":
                     view = "views/" + revision

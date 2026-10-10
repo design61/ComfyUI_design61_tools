@@ -44,6 +44,33 @@ End 的 `Continue all remaining chunks` 可在逐段 Review 中接受当前段�
 
 原版的 Sampler、Reference Images、Reference Audios、Video Adapter、Finalize 不在本工具集中重复注册。采样器与 latent 放大器由外部节点提供。
 
+### 完成后追加新段
+
+例如前三段已经完成，下次想继续生成第四段：
+
+1. 打开保存的工作流。End 会重新读取它引用的序列状态；旧工作流可点击 **Load saved sequence**，在下拉框选择记录，再点 **Load selected sequence**。
+2. 将 Start 的 **Chunks 从 3 改成 4**，在上游补充第四段提示词。保持原来的每段时长、分辨率与续写参数。
+3. 在 End 点击 **Append all new chunks**，只生成第四段并保留前三段。若想生成一段后停下来查看，将 Start 设为 `Review Each Chunk`，使用 **Append next chunk**。
+
+同样支持提前结束的序列：原计划 4 段、在第 3 段点了 `Finish here`，也可以从第 4 段继续，无需先增加到 5 段。界面根据实际保存段数显示追加按钮和剩余数量。`Full Video` 完成后的追加入口为 **Append all new chunks**。
+
+**蓝色 Run 会从第 1 段开始新任务；续写已有视频请使用 End 的追加按钮。** 请保留该序列的 Session 或存帧目录（包括 tail State），仅剩最终 MP4 无法续接。
+
+### 选择和切换已保存的历史序列
+
+在 `Review Each Chunk` 模式下，点击 End 的 **Switch saved sequence**，可以打开或刷新同一 Run Name、存储目录下的已保存序列列表。
+
+| 控件 | 用法 |
+| --- | --- |
+| Load saved sequence | 旧工作流或新加的 End 节点，用它查找已保存序列 |
+| Saved sequence | 下拉选择记录；列表显示已保存段数、保存时间和用于区分记录的短编号 |
+| Load selected sequence | 载入所选序列的最新状态，后续追加、重试和选段重做针对它执行 |
+| Switch saved sequence | 重新打开或刷新历史序列列表，可以再次选择其他记录 |
+
+选择列表在载入后仍保留，可以从历史 A 切到 B，再回到 A。只改变下拉选项不会切换当前序列，需点击 **Load selected sequence**；载入本身不采样、不删除素材。
+
+这个入口替代原先只显示文本记录的 `Render History`。列表中的“历史序列”是磁盘上仍可续接的已保存序列，不是每次重试产生的单个 Take。帧模式中已被替代并清理素材的旧 Take 不能通过这个列表恢复。
+
 ### 单采长视频工作流案例
 
 [**下载 MiniMax H3 自定义单采长视频工作流**](examples/MiniMax_H3_single_sampler_design61.json)
@@ -70,7 +97,7 @@ End 的 `Continue all remaining chunks` 可在逐段 Review 中接受当前段�
 git clone https://github.com/design61/ComfyUI_design61_tools.git
 ```
 
-也可以到 [Releases](https://github.com/design61/ComfyUI_design61_tools/releases/latest) 下载插件 ZIP，将 `ComfyUI_design61_tools` 文件夹解压到 `custom_nodes`。随后重启 ComfyUI 并刷新页面。节点名称都带 `_design61` 后缀。
+也可以[下载 main 分支的当前源码 ZIP](https://github.com/design61/ComfyUI_design61_tools/archive/refs/heads/main.zip)，解压后将插件目录命名为 `ComfyUI_design61_tools`，放入 `custom_nodes`。随后重启 ComfyUI，并在浏览器按 **Ctrl+F5** 刷新。节点名称都带 `_design61` 后缀。已使用 Git 安装的用户可在插件目录执行 `git pull` 更新。
 
 使用 H3 长视频功能时，需要同时安装原版 [ComfyUI-H3-Continuum](https://github.com/ukr8b3g-cmyk/ComfyUI-H3-Continuum)、支持 MiniMax H3 的 ComfyUI、相应模型与音视频 VAE，以及案例使用的其他外部节点。模型、VAE 和素材不在本包中。
 

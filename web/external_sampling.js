@@ -46,7 +46,9 @@ function reviewError(node, message) {
 }
 
 export function externalReviewActions(state) {
-    if (state?.mode === "Full Video") return [];
+    const append = state?.status === "complete" && state.accepted > 0 && Number(state.planned_chunks) > Number(state.accepted);
+    if (state?.mode === "Full Video") return append ? [CONTINUE_ALL] : [];
+    if (append) return [CONTINUE, CONTINUE_ALL, ...(state.review_unit ? [RETRY] : []), RESTART];
     if (state?.status === "review_ready") return [CONTINUE, CONTINUE_ALL, ...(state.stopped && !state.accepted ? [] : [FINISH]), RETRY, RESTART];
     if (state?.status === "complete" && state.review_unit) return [RETRY, RESTART];
     return [];
@@ -122,7 +124,7 @@ function statusPanel(node, state, preview = false) {
     const bar = create("div", "", "height:5px;background:#344c3d;border-radius:4px;margin:9px 0 7px;overflow:hidden");
     const ratio = state.chunks ? Math.min(1, (state.completed || 0) / state.chunks) : 0;
     bar.append(create("div", "", `height:100%;width:${ratio*100}%;background:${color};border-radius:4px`)); panel.append(bar);
-    const label = preview ? "Ready · choose a mode and Queue" : state.stopped ? `Stopped at chunk ${state.current ?? state.completed} · kept ${state.completed}` : state.status === "complete" ? `Complete · ${state.completed_seconds ?? ""} s${state.skipped ? ` · ${state.skipped} chunks omitted` : ""}` : state.status === "review_ready" ? `Chunk ${state.completed} ready · choose an action below` : running ? `Running chunk ${state.current ?? "—"} / ${state.chunks}` : "Waiting for backend status";
+    const label = preview ? "Ready · choose a mode and Queue" : state.append_available ? `Saved ${state.completed} chunks · use End to append` : state.stopped ? `Stopped at chunk ${state.current ?? state.completed} · kept ${state.completed}` : state.status === "complete" ? `Complete · ${state.completed_seconds ?? ""} s${state.skipped ? ` · ${state.skipped} chunks omitted` : ""}` : state.status === "review_ready" ? `Chunk ${state.completed} ready · choose an action below` : running ? `Running chunk ${state.current ?? "—"} / ${state.chunks}` : "Waiting for backend status";
     panel.append(create("div", label + (state.storage_mode === FRAME_STORAGE ? " · Frames on disk" : ""), "font-size:11px;color:"+color));
     host.append(panel);
     node.setDirtyCanvas?.(true, true);
@@ -152,7 +154,10 @@ function refreshStart(node) {
                 const edge = source.graph?.links?.[id];
                 const target = source.graph?.getNodeById?.(edge?.target_id);
                 if ((target?.comfyClass || target?.type) === END) {
-                    if (target._externalReviewState && findExternalSequenceStart(target) === node) updatePanel(target, target._externalReviewState, true);
+                    if (target._externalReviewState && findExternalSequenceStart(target) === node) {
+                        const saved = target._externalReviewState;
+                        updatePanel(target, saved, true);
+                    }
                 } else if (target?.inputs?.length === 1 && target.inputs[0].link === id) {
                     pending.push(target); // Single-input reroute/pass-through.
                 }
@@ -167,6 +172,8 @@ function updatePanel(node, state, presentationOnly = false) {
     if (control?.stop_requested && (control.running || !control.ready || (state.control_token === control.token && !state.stopped))) return;
     if (control?.stop_requested && !state.control_token && !state.stopped) node._externalControl = null;
     node._externalReviewState = state;
+    node.properties ||= {};
+    node.properties.design61_sequence_reference = {revision:state.revision, contract:state.contract, run_name:state.run_name, storage_mode:state.storage_mode, frame_root:state.frame_root, chunks:state.chunks, seconds:state.progress?.seconds};
     node.widgets = (node.widgets || []).filter((widget) => !widget._externalReview);
     const add = (type, name, value, callback, tooltip, extra = {}) => {
         const widget = node.addWidget(type, name, value, callback, { ...extra, serialize: false, tooltip });
@@ -183,9 +190,14 @@ function updatePanel(node, state, presentationOnly = false) {
     const revision = find("expected_revision");
     if (action) action.value = "Start / Resume";
     if (revision) revision.value = ""; // Only an explicit button supplies a Review reference.
-    if (state.progress && !presentationOnly) {
-        statusPanel(node, state.progress);
-        if (linkedStart) statusPanel(linkedStart, state.progress);
+    const plannedChunks = Number(find("chunks")?.value);
+    const canAppend = state.status === "complete" && state.accepted > 0 && plannedChunks > Number(state.accepted);
+    const progress = canAppend && state.progress ? {...state.progress, chunks:plannedChunks,
+        total_seconds:plannedChunks*Number(find("chunk_seconds")?.value ?? state.progress.seconds),
+        remaining:Math.max(0,plannedChunks-state.accepted), append_available:true} : state.progress;
+    if (progress && (!presentationOnly || canAppend)) {
+        statusPanel(node, progress);
+        if (linkedStart) statusPanel(linkedStart, progress);
     }
     const label = state.stopped && state.review_unit?.pending ? `Stopped during Chunk ${state.review_unit.chunk} · kept ${state.accepted} chunks` : state.status === "complete" ? "Saved sequence is complete" : state.status === "review_ready" ? `Chunk ${state.accepted} is ready for review` : `Generating ${state.accepted}/${state.chunks} chunks`;
     add("text", "Review status", label, () => {}, "Canonical saved backend status. Review controls are never inferred from visible widget values.");
@@ -233,12 +245,14 @@ function updatePanel(node, state, presentationOnly = false) {
                 node._externalControl = null;
             }
             node.setDirtyCanvas?.(true, true);
+            node._externalReviewQueueing = true;
             try {
                 await app.queuePrompt(0, 1);
             } catch (error) {
                 node._externalControl ||= previousControl;
                 reviewError(node, `Could not queue ${label}: ${error?.message || error}`);
             } finally {
+                node._externalReviewQueueing = false;
                 // Do not leave a Review command armed for the blue Queue button.
                 // Avoid clearing a newer command submitted by another click.
                 if (command.value === label && expected.value === reference) {
@@ -247,8 +261,9 @@ function updatePanel(node, state, presentationOnly = false) {
                 }
             }
     };
-    for (const label of externalReviewActions({ ...state, mode: selectedMode })) {
-        add("button", label, null, () => queueAction(label), label === CONTINUE_ALL ? "Keep all accepted chunks and automatically generate every remaining chunk without Review pauses. Uses updated upstream prompts. Normal blue Queue still starts fresh." : label === FINISH ? "Finalize only accepted chunks now. No remaining chunk is sampled." : label === RESTART ? (framesOnDisk ? "Generate again from chunk 1. After the new first chunk commits, previous frame-mode media/tails are removed." : "Generate again from chunk 1 with a new seed nonce; all old Takes remain stored.") : label === RETRY ? (framesOnDisk ? "Regenerate this chunk, preserving earlier chunks. Replace its old frames/tail only after the new chunk commits." : "Generate a new Take for this chunk, preserving the accepted prefix and old Take.") : "Accept this chunk and execute exactly the next chunk. Its index and media window advance automatically.");
+    for (const label of externalReviewActions({ ...state, mode: selectedMode, planned_chunks: plannedChunks })) {
+        const title = state.status === "complete" && label === CONTINUE_ALL ? "Append all new chunks" : state.status === "complete" && label === CONTINUE ? "Append next chunk" : label;
+        add("button", title, null, () => queueAction(label), label === CONTINUE_ALL ? "Keep all accepted chunks and automatically generate every remaining chunk without Review pauses. Uses updated upstream prompts. Normal blue Queue still starts fresh." : label === FINISH ? "Finalize only accepted chunks now. No remaining chunk is sampled." : label === RESTART ? (framesOnDisk ? "Generate again from chunk 1. After the new first chunk commits, previous frame-mode media/tails are removed." : "Generate again from chunk 1 with a new seed nonce; all old Takes remain stored.") : label === RETRY ? (framesOnDisk ? "Regenerate this chunk, preserving earlier chunks. Replace its old frames/tail only after the new chunk commits." : "Generate a new Take for this chunk, preserving the accepted prefix and old Take.") : "Accept this chunk and execute exactly the next chunk. Its index and media window advance automatically.");
     }
     const chunks = state.accepted_chunks || [];
     if (selectedMode !== "Full Video" && ["review_ready", "complete"].includes(state.status) && chunks.length) {
@@ -262,20 +277,105 @@ function updatePanel(node, state, presentationOnly = false) {
             return queueAction(REGENERATE_FROM, target);
         }, "Regenerate the selected chunk using current prompts, then pause for Review. Later old chunks leave the active sequence when this Take succeeds; continue to regenerate following chunks. " + historyHelp);
     }
-    if (state.history?.length && selectedMode !== "Full Video") {
-        add("button", `Render History — ${state.history.length} Takes`, null, () => {
-            const existing = node.widgets.find((widget) => widget._externalHistory);
-            if (existing) node.widgets = node.widgets.filter((widget) => widget !== existing);
-            else {
-                const history = add("text", "Saved Takes", state.history.map((item) => `Chunk ${item.chunk}: ${item.revision.slice(0, 8)} / seed ${item.seed}${item.discarded ? " / media removed" : ""}`).join(" | "), () => {}, historyHelp);
-                history._externalHistory = true;
-            }
-            node.setSize(node.computeSize());
-            node.setDirtyCanvas(true, true);
-        }, historyHelp);
+    if (state.contract && state.run_name && selectedMode !== "Full Video" && ["review_ready", "complete"].includes(state.status)) {
+        add("button", "Switch saved sequence", null, () => loadSavedSequenceChoices(node),
+            "Choose another saved sequence for this run name and storage location. Reads metadata only; loading never samples, deletes media or restores discarded Takes.");
+        savedSequencePicker(node);
     }
     node.setSize(node.computeSize());
     node.setDirtyCanvas(true, true);
+}
+
+function savedSequenceLoader(node) {
+    if (node._externalReviewState || node.widgets?.some(item => item.name === "Load saved sequence")) return;
+    const status = node.addWidget("text", "Review status", "Load a saved sequence to resume without sampling", () => {}, {serialize:false,tooltip:"Loading reads saved metadata only. Choose the correct saved lineage before appending."});
+    status.serialize = false; status._externalReview = true;
+    const item = node.addWidget("button", "Load saved sequence", null, () => loadSavedSequenceChoices(node),
+        {serialize:false,tooltip:"Choose a saved sequence without sampling. The selector stays available after loading so you can switch again. Blue Run always starts fresh."});
+    item.serialize = false; item._externalReview = true;
+}
+
+function savedSequenceIdentity(state) {
+    return JSON.stringify([state?.run_name, state?.contract, state?.storage_mode, state?.frame_root || ""]);
+}
+
+function loadSavedSequenceChoices(node) {
+    const start = findExternalSequenceStart(node);
+    if (!start) return reviewError(node, "Connect flow to Sequence Start before loading a saved sequence.");
+    // After loading, refresh the original catalogue rather than searching a
+    // different storage location due to edited generation widgets.
+    const saved = node._externalSavedSearchReference || node._externalReviewState;
+    const reference = saved ? {run_name:saved.run_name, storage_mode:saved.storage_mode, frame_root:saved.frame_root,
+        chunks:widget(start, "chunks")?.value, seconds:widget(start, "chunk_seconds")?.value} : {
+        run_name:widget(start, "run_name")?.value, storage_mode:widget(start, "storage_mode")?.value,
+        frame_root:widget(start, "frame_root")?.value, chunks:widget(start, "chunks")?.value,
+        seconds:widget(start, "chunk_seconds")?.value};
+    return restoreSavedSequence(node, reference, true);
+}
+
+function savedSequencePicker(node) {
+    node.widgets = (node.widgets || []).filter(item => !item._externalSavedPicker);
+    const states = node._externalSavedSequences || [];
+    if (!node._externalHistoryOpen || !states.length || node._externalControl?.running) return;
+    const values = states.map((state, index) => `${index + 1}: ${state.accepted} chunks · ${new Date(state.saved_at * 1000).toLocaleString()} · ${state.contract.slice(0, 8)}`);
+    const current = node._externalSavedSelection || savedSequenceIdentity(node._externalReviewState);
+    const selected = Math.max(0, states.findIndex(state => savedSequenceIdentity(state) === current));
+    const choice = node.addWidget("combo", "Saved sequence", values[selected], value => {
+        const state = states[values.indexOf(value)];
+        if (state) node._externalSavedSelection = savedSequenceIdentity(state);
+    }, {values,serialize:false,tooltip:"Select a saved sequence, then click Load selected sequence. Choosing alone does not change the loaded sequence."});
+    const button = node.addWidget("button", "Load selected sequence", null, () => {
+        const state = states[values.indexOf(choice.value)];
+        if (!state) return reviewError(node, "Choose a saved sequence from the list.");
+        return restoreSavedSequence(node, {run_name:state.run_name, contract:state.contract,
+            storage_mode:state.storage_mode, frame_root:state.frame_root, chunks:state.chunks, seconds:state.progress?.seconds});
+    }, {serialize:false,tooltip:"Read fresh canonical metadata for the selected sequence. No sampling or deletion; use End's generation buttons when ready."});
+    for (const item of [choice, button]) {item._externalReview=true;item._externalSavedPicker=true;item.serialize=false;}
+    node.setSize?.(node.computeSize()); node.setDirtyCanvas?.(true,true);
+}
+
+async function restoreSavedSequence(node, reference, choose = false) {
+    if (node._externalControl?.running || node._externalReviewQueueing) {
+        return reviewError(node, "Wait for this run to finish or Stop before switching saved sequences.");
+    }
+    const current = node._externalReviewState;
+    const ticket = Symbol(); node._externalRestoreTicket = ticket;
+    try {
+        const response = await api.fetchApi("/design61/external-sequence/review", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(reference)});
+        const data = await response.json();
+        if (!response.ok) throw Error(data.error || "Could not load saved sequence");
+        if (node._externalRestoreTicket !== ticket || node._externalReviewState !== current || node._externalControl?.running || node._externalReviewQueueing) return;
+        const states = data.sequences || [];
+        if (!states.length) throw Error("No saved sequence found. Check Run Name, storage mode and frame root.");
+        if (reference.contract) {
+            const existing = node._externalSavedSequences || [];
+            node._externalSavedSequences = [
+                ...existing.map(old => states.find(state => savedSequenceIdentity(old) === savedSequenceIdentity(state)) || old),
+                ...states.filter(state => !existing.some(old => savedSequenceIdentity(old) === savedSequenceIdentity(state)))];
+        } else {
+            node._externalSavedSequences = states;
+            node._externalSavedSearchReference = {...reference};
+        }
+        if (choose || states.length > 1) {
+            node._externalHistoryOpen = true;
+            savedSequencePicker(node);
+            return;
+        }
+        showSavedSequence(node, states[0]);
+    } catch (error) {
+        if (node._externalRestoreTicket === ticket && node._externalReviewState === current) reviewError(node, `Saved sequence: ${error?.message || error}`);
+    }
+}
+
+function showSavedSequence(node, state) {
+    if (savedSequenceIdentity(node._externalReviewState) !== savedSequenceIdentity(state)) node._externalRestartChunk = null;
+    node._externalSavedSelection = savedSequenceIdentity(state);
+    updatePanel(node, state);
+    const start = findExternalSequenceStart(node);
+    if (start) {
+        start._externalPreviewKey = null;
+        refreshStart(start);
+    }
 }
 
 const controlTimers = new Map();
@@ -390,6 +490,27 @@ app.registerExtension({
             return;
         }
         if (nodeData.name !== END) return;
+        const created = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            const result = created?.apply(this, arguments);
+            savedSequenceLoader(this);
+            return result;
+        };
+        const configured = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            const result = configured?.apply(this, arguments);
+            this._externalReviewState = null;
+            this._externalControl = null;
+            this._externalSavedSequences = null;
+            this._externalSavedSearchReference = null;
+            this._externalSavedSelection = null;
+            this._externalHistoryOpen = false;
+            this.widgets = (this.widgets || []).filter(item => !item._externalReview);
+            savedSequenceLoader(this);
+            const reference = this.properties?.design61_sequence_reference;
+            if (reference?.contract) queueMicrotask(() => restoreSavedSequence(this, reference));
+            return result;
+        };
         const previous = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (message) {
             previous?.apply(this, arguments);
